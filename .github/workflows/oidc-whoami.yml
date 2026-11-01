@@ -1,0 +1,33 @@
+# OIDC の動作確認。AWS には何も作らない。sub の実際の形式もここで分かる
+name: 接続確認（OIDC whoami）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  whoami:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: OIDC トークンのクレームを表示（トークン本体は出さない）
+        run: |
+          TOKEN=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)
+          echo "::add-mask::${TOKEN}"
+          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#PAYLOAD} % 4 )) -ne 0 ]; do PAYLOAD="${PAYLOAD}="; done
+          echo "$PAYLOAD" | base64 -d | jq '{iss, aud, sub, repository, ref, environment, event_name, actor}' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ap-northeast-1
+          mask-aws-account-id: true
+
+      - name: AWS 側から見た自分
+        run: aws sts get-caller-identity

@@ -1,0 +1,147 @@
+# Actions → "構築・削除（Terraform）" → Run workflow
+#   plan ジョブ : plan ロール（読み取り専用）で plan → ジョブサマリーへ
+#   apply ジョブ: Environment の承認後、apply ロールで apply / destroy
+name: 構築・削除（Terraform）
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: "対象スタック（terraform/<stack>）"
+        required: true
+        type: choice
+        # base: VPC など毎回は消さないもの / db: Aurora と負荷用 EC2（作業日ごとに destroy）
+        options: [base, db] # スタックを増やしたらここに追加
+      action:
+        description: "plan=確認のみ / apply=構築・変更 / destroy=削除"
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+
+permissions:
+  id-token: write # OIDC トークンの発行に必須
+  contents: read
+
+concurrency:
+  group: terraform-${{ inputs.stack }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.12.2"
+  AWS_REGION: ap-northeast-1
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_VAR_project: ${{ vars.PROJECT }}
+  # 例: TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+  #     TF_VAR_instance_type: ${{ vars.INSTANCE_TYPE || 't4g.nano' }}
+
+jobs:
+  plan:
+    name: plan (${{ inputs.stack }} / ${{ inputs.action }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: terraform/${{ inputs.stack }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ inputs.stack }}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="use_lockfile=true"
+
+      - name: terraform fmt / validate
+        run: |
+          terraform fmt -check -diff
+          terraform validate -no-color
+
+      # plan ロールは S3 に書けないので -lock=false。書き込みは apply ジョブだけ
+      - name: terraform plan
+        run: |
+          set -o pipefail
+          terraform plan -no-color -lock=false ${{ inputs.action == 'destroy' && '-destroy' || '' }} > plan_raw.txt
+          # ジョブサマリーにはマスクが効かないことがあるのでアカウントIDを自分で伏せる
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          sed "s/${ACCOUNT_ID}/************/g" plan_raw.txt > plan.txt
+          rm -f plan_raw.txt
+          cat plan.txt
+          {
+            echo "## plan: ${{ inputs.stack }} / ${{ inputs.action }}"
+            echo '```'
+            grep -E '^(Plan:|No changes|Changes to Outputs)' plan.txt || true
+            echo '```'
+            echo "<details><summary>全文</summary>"
+            echo
+            echo '```'
+            cat plan.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: ${{ inputs.action }} (${{ inputs.stack }})
+    needs: plan
+    if: inputs.action != 'plan'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Required reviewers を設定した Environment。sub が ...:environment:<名前> になり apply ロールに入れる
+    environment: db-sharding-aws-apply
+    defaults:
+      run:
+        working-directory: terraform/${{ inputs.stack }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ inputs.stack }}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="use_lockfile=true"
+
+      # plan ファイルは Artifact で渡さない（public リポジトリでは誰でも取得できる）
+      - name: terraform ${{ inputs.action }}
+        run: |
+          if [ "${{ inputs.action }}" = "destroy" ]; then
+            terraform destroy -auto-approve -no-color
+          else
+            terraform apply -auto-approve -no-color
+          fi
+
+      - name: outputs
+        if: inputs.action == 'apply'
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          {
+            echo "## outputs: ${{ inputs.stack }}"
+            echo '```'
+            terraform output -no-color | sed "s/${ACCOUNT_ID}/************/g"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

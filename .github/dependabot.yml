@@ -1,0 +1,25 @@
+# 依存バージョンの更新 PR を Dependabot に作らせる
+version: 2
+updates:
+  # ワークフローの uses: のアクション
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  # Terraform の provider（required_providers / .terraform.lock.hcl）
+  - package-ecosystem: "terraform"
+    directories:
+      - "/terraform/*"
+    schedule:
+      interval: "monthly"
+    groups:
+      terraform:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
