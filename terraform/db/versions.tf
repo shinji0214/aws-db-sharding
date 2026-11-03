@@ -31,5 +31,3 @@ variable "region" {
   type    = string
   default = "ap-northeast-1"
 }
-
-# リソースは検証計画の合意後に追加する

@@ -1,0 +1,206 @@
+[
+  {
+    "Id": "cpuutilization",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "CPUUtilization",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "dmlthroughput",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "DMLThroughput",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "dmllatency",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "DMLLatency",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "committhroughput",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "CommitThroughput",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "commitlatency",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "CommitLatency",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "databaseconnections",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "DatabaseConnections",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "freeablememory",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "FreeableMemory",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "cpucreditbalance",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "CPUCreditBalance",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "cpucreditusage",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "CPUCreditUsage",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "cpusurpluscreditbalance",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "CPUSurplusCreditBalance",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "cpusurpluscreditscharged",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "CPUSurplusCreditsCharged",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "networkthroughput",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/RDS",
+        "MetricName": "NetworkThroughput",
+        "Dimensions": [
+          {
+            "Name": "DBInstanceIdentifier",
+            "Value": "db-sharding-aws-a-1"
+          }
+        ]
+      },
+      "Period": 60,
+      "Stat": "Average"
+    }
+  }
+]

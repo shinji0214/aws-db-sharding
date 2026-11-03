@@ -5,3 +5,5 @@ github_repo_id    = "<REPO_ID>"  # gh api repos/<OWNER>/<REPO> --jq .id
 apply_environment = "db-sharding-aws-apply"
 # OIDC プロバイダは terraform/github-oidc が持つ（先にそちらを apply）
 create_github_oidc_provider = false
+# 予算アラート（月 $30、50% / 100% / 予測100% でメール）。空なら作らない
+budget_email = "<通知先メールアドレス>"

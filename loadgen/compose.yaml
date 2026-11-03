@@ -1,0 +1,32 @@
+# Day 0: AWS を使わずに手元で負荷スクリプトの動作を確認する（MySQL 8.0 を2台 = 2シャード）
+#   docker compose up -d mysql-a mysql-b
+#   docker compose run --rm loadgen prepare --rows 10000
+#   docker compose run --rm loadgen sweep --scenario s2 --threads "2 4" --time 10 --warmup 3 --rows 10000
+#   docker compose down -v
+# 1シャードで試すときは SHARDS=a、DB_HOSTS=mysql-a にする。手元の数値は性能の目安にはならない（動作確認だけ）
+services:
+  mysql-a: &mysql
+    image: public.ecr.aws/docker/library/mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: localpass
+      MYSQL_DATABASE: lab
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-plocalpass"]
+      interval: 5s
+      retries: 30
+  mysql-b: *mysql
+
+  loadgen:
+    build: .
+    environment:
+      SHARDS: a,b
+      DB_HOSTS: mysql-a,mysql-b
+      DB_USER: root
+      DB_PASSWORD: localpass
+      DB_NAME: lab
+      DB_INSTANCE_CLASS: local
+    volumes:
+      - ./results:/results
+    depends_on:
+      mysql-a: { condition: service_healthy }
+      mysql-b: { condition: service_healthy }

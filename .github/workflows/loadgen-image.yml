@@ -1,0 +1,55 @@
+# Actions → "負荷ツールのイメージ作成" → Run workflow
+# loadgen/ を ARM64 でビルドして ECR（base スタックが作る <PROJECT>/loadgen）に push する。
+# ECR への書き込みは apply ロールなので、Environment の承認が要る。base を apply した後に1回、
+# loadgen/ を変えたらもう一度実行する。タグは latest とコミット SHA の2つ
+name: 負荷ツールのイメージ作成
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: loadgen-image
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  build:
+    # Fargate を ARM64（Graviton）で動かすので、ARM のランナーでそのままビルドする（public リポジトリは無料）
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    environment: db-sharding-aws-apply
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: build and push
+        env:
+          PROJECT: ${{ vars.PROJECT }}
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "::add-mask::${ACCOUNT_ID}"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          REPO="${REGISTRY}/${PROJECT}/loadgen"
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${REGISTRY}"
+          docker build --pull -t "${REPO}:${GITHUB_SHA}" -t "${REPO}:latest" loadgen
+          docker run --rm --entrypoint sysbench "${REPO}:latest" --version
+          docker push "${REPO}:${GITHUB_SHA}"
+          docker push "${REPO}:latest"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "${REPO}:latest" | sed 's/.*@//')
+          {
+            echo "## loadgen image"
+            echo "- tags: \`latest\`, \`${GITHUB_SHA}\`"
+            echo "- digest: \`${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

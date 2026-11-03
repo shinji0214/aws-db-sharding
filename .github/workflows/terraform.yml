@@ -10,13 +10,23 @@ on:
         description: "対象スタック（terraform/<stack>）"
         required: true
         type: choice
-        # base: VPC など毎回は消さないもの / db: Aurora と負荷用 EC2（作業日ごとに destroy）
+        # base: VPC・ECR・結果バケットなど毎回は消さないもの / db: Aurora と負荷生成の ECS（作業日ごとに destroy）
         options: [base, db] # スタックを増やしたらここに追加
       action:
         description: "plan=確認のみ / apply=構築・変更 / destroy=削除"
         required: true
         type: choice
         options: [plan, apply, destroy]
+      shards:
+        description: "db のみ: 作るシャード（パターン1・1b = [\"a\"] / パターン2 = [\"a\",\"b\"]）"
+        required: true
+        type: choice
+        options: ['["a"]', '["a","b"]', '["a","b","c"]']
+      instance_class:
+        description: "db のみ: Writer のインスタンス種別（パターン1b はここを変えて apply）"
+        required: true
+        type: string
+        default: db.t4g.medium
 
 permissions:
   id-token: write # OIDC トークンの発行に必須
@@ -32,12 +42,15 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
   TF_VAR_project: ${{ vars.PROJECT }}
-  # 例: TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
-  #     TF_VAR_instance_type: ${{ vars.INSTANCE_TYPE || 't4g.nano' }}
+  # db スタックの変数（base では宣言していないので無視される）
+  TF_VAR_shards: ${{ inputs.shards }}
+  TF_VAR_instance_class: ${{ inputs.instance_class }}
+  # 作業日をまたいでエンジンバージョンを揃える。Day 1 の outputs の engine_version を Variables に登録する
+  TF_VAR_engine_version: ${{ vars.DB_ENGINE_VERSION || '' }}
 
 jobs:
   plan:
-    name: plan (${{ inputs.stack }} / ${{ inputs.action }})
+    name: plan (${{ inputs.stack }} / ${{ inputs.action }} / ${{ inputs.shards }} ${{ inputs.instance_class }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
