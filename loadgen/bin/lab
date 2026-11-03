@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# 負荷生成タスクの入口。ECS の run-task の command（scripts/loadgen.ps1）か、手元の docker compose から呼ぶ。
+#
+#   lab idle                     何もせず待つ（ECS Exec で入って手で操作する用。IDLE_MAX_SECONDS で自動終了）
+#   lab prepare [--rows N]       全シャードにテーブルを作り直してデータを入れる
+#   lab sweep [options]          スレッド数を段階的に増やして測る（シナリオ1・2・3、SELECT 1 の上限確認）
+#   lab sums                     全シャードの SUM(score)・SUM(balance)・件数（シナリオ4・5の照合用）
+#   lab sql <shard> [mysql args] シャードに mysql クライアントでつなぐ（ECS Exec の中で使う）
+#
+# 接続先は環境変数で受け取る（db スタックのタスク定義が設定する）
+#   SHARDS=a,b  DB_HOSTS=<a の endpoint>,<b の endpoint>  DB_USER  DB_NAME
+#   DB_PASSWORD_A, DB_PASSWORD_B ...（無ければ DB_PASSWORD を全シャード共通で使う。手元確認用）
+#   RESULTS_BUCKET（空なら S3 に上げず /results に残すだけ）
+set -euo pipefail
+
+LUA_DIR=/opt/lab/lua
+RESULTS_ROOT=${RESULTS_ROOT:-/results}
+
+IFS=',' read -r -a SHARD_KEYS <<<"${SHARDS:-a}"
+IFS=',' read -r -a SHARD_HOSTS <<<"${DB_HOSTS:-127.0.0.1}"
+NSHARDS=${#SHARD_KEYS[@]}
+DB_USER=${DB_USER:-admin}
+DB_NAME=${DB_NAME:-lab}
+DB_PORT=${DB_PORT:-3306}
+
+log() { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+[[ ${#SHARD_HOSTS[@]} -eq $NSHARDS ]] || die "SHARDS と DB_HOSTS の数が合わない"
+
+shard_password() {
+  local key=${1^^}
+  local var="DB_PASSWORD_${key}"
+  if [[ -n "${!var:-}" ]]; then echo "${!var}"; else echo "${DB_PASSWORD:?DB_PASSWORD_${key} も DB_PASSWORD も無い}"; fi
+}
+
+# DB_HOSTS の要素は host か host:port（手元確認で同じホストの別ポートを使うため）
+shard_host() { echo "${SHARD_HOSTS[$1]%%:*}"; }
+shard_port() {
+  local h=${SHARD_HOSTS[$1]}
+  if [[ $h == *:* ]]; then echo "${h##*:}"; else echo "$DB_PORT"; fi
+}
+
+# mysql クライアント。パスワードは引数に出さない（ps やログに残さない）
+mysql_shard() {
+  local i=$1; shift
+  MYSQL_PWD="$(shard_password "${SHARD_KEYS[$i]}")" mysql -h "$(shard_host "$i")" -P "$(shard_port "$i")" -u "$DB_USER" \
+    --connect-timeout=10 "$@"
+}
+
+# sysbench 共通引数（パスワードは環境変数経由にできないので、引数に渡すがログには出さない）
+sysbench_args() {
+  local i=$1
+  echo "--db-driver=mysql --mysql-host=$(shard_host "$i") --mysql-port=$(shard_port "$i") --mysql-user=${DB_USER}" \
+    "--mysql-password=$(shard_password "${SHARD_KEYS[$i]}") --mysql-db=${DB_NAME}"
+}
+
+wait_for_db() {
+  local i
+  for i in "${!SHARD_KEYS[@]}"; do
+    for _ in $(seq 1 60); do
+      if mysql_shard "$i" -e "SELECT 1" "$DB_NAME" >/dev/null 2>&1; then continue 2; fi
+      sleep 5
+    done
+    die "shard ${SHARD_KEYS[$i]} に接続できない"
+  done
+}
+
+upload() {
+  local dir=$1
+  [[ -n "${RESULTS_BUCKET:-}" ]] || return 0
+  aws s3 cp --only-show-errors --recursive "$RESULTS_ROOT/$dir" "s3://${RESULTS_BUCKET}/runs/$dir/" ||
+    log "WARN: S3 へのアップロードに失敗（タスクが止まると消えるので注意）"
+}
+
+# ---------------------------------------------------------------- prepare
+cmd_prepare() {
+  local rows=100000
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --rows) rows=$2; shift 2 ;;
+      *) die "prepare: 不明な引数 $1" ;;
+    esac
+  done
+  wait_for_db
+  local i
+  for i in "${!SHARD_KEYS[@]}"; do
+    local first=$((i + 1))
+    local cnt=$(((rows - first) / NSHARDS + 1))
+    log "prepare shard=${SHARD_KEYS[$i]} ids=${first},$((first + NSHARDS)),... count=${cnt}"
+    mysql_shard "$i" "$DB_NAME" >/dev/null <<SQL
+DROP TABLE IF EXISTS users, accounts, transfer_log;
+CREATE TABLE users (
+  id BIGINT PRIMARY KEY,
+  score BIGINT NOT NULL,
+  updated_at DATETIME NOT NULL
+);
+CREATE TABLE accounts (
+  user_id BIGINT PRIMARY KEY,
+  balance BIGINT NOT NULL,
+  CHECK (balance >= 0)
+);
+CREATE TABLE transfer_log (
+  tx_id CHAR(36) PRIMARY KEY,
+  from_user BIGINT NOT NULL,
+  to_user BIGINT NOT NULL,
+  amount BIGINT NOT NULL,
+  state VARCHAR(16) NOT NULL,
+  created_at DATETIME NOT NULL
+);
+SET SESSION cte_max_recursion_depth = ${cnt};
+INSERT INTO users (id, score, updated_at)
+  WITH RECURSIVE k (n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM k WHERE n + 1 < ${cnt})
+  SELECT ${first} + ${NSHARDS} * n, 0, NOW() FROM k;
+INSERT INTO accounts (user_id, balance) SELECT id, 10000 FROM users;
+ANALYZE TABLE users, accounts;
+SQL
+  done
+  cmd_sums
+}
+
+# ---------------------------------------------------------------- sums
+cmd_sums() {
+  local i
+  printf '%-6s %10s %15s %15s\n' shard rows sum_score sum_balance
+  for i in "${!SHARD_KEYS[@]}"; do
+    mysql_shard "$i" -N -B "$DB_NAME" -e \
+      "SELECT '${SHARD_KEYS[$i]}', COUNT(*), SUM(score), (SELECT SUM(balance) FROM accounts) FROM users" |
+      awk '{printf "%-6s %10s %15s %15s\n", $1, $2, $3, $4}'
+  done
+}
+
+# ---------------------------------------------------------------- sweep
+usage_sweep() {
+  cat >&2 <<'EOF'
+lab sweep [options]
+  --scenario NAME   結果の見出し（例: s1, s2, s3, select1）。既定 s1
+  --threads "1 2 4" 全シャード合計のスレッド数の段階。既定 "1 2 4 8 16 32 64 128 256"
+  --time SEC        各段階の計測秒数。既定 180
+  --warmup SEC      各段階の前のウォームアップ秒数（結果に含めない）。既定 60
+  --repeat N        各段階の繰り返し回数（飽和点付近の再測定用）。既定 1
+  --rows N          prepare した合計行数。既定 100000
+  --hot-id ID       ホットスポット（シナリオ3）。この id を持つシャードだけに全スレッドを向ける
+  --batch N         1トランザクションの UPDATE 件数。既定 1（自動コミット）
+  --rate TPS        固定レート（全シャード合計）。0 = 上限まで。既定 0
+  --select1         UPDATE の代わりに SELECT 1（負荷側の上限確認）
+  --label TEXT      結果に残すメモ（例: pattern1b-r6g.large）
+EOF
+}
+
+# sysbench の出力（複数ファイル）からヒストグラムを合算してパーセンタイルを出す
+percentiles() {
+  gawk '
+    /^Latency histogram/ { inh = 1; next }
+    inh && /^ *[0-9.]+ \|/ { v = $1 + 0; c = $NF + 0; cnt[v] += c; total += c; next }
+    inh && NF == 0 { inh = 0 }
+    END {
+      if (total == 0) { print "NA NA"; exit }
+      n = asorti(cnt, keys, "@ind_num_asc")
+      t95 = total * 0.95; t99 = total * 0.99; acc = 0; p95 = ""; p99 = ""
+      for (j = 1; j <= n; j++) {
+        acc += cnt[keys[j]]
+        if (p95 == "" && acc >= t95) p95 = keys[j]
+        if (p99 == "" && acc >= t99) { p99 = keys[j]; break }
+      }
+      printf "%s %s\n", p95, p99
+    }' "$@"
+}
+
+sum_field() { # sysbench 出力から "transactions: N (X per sec.)" の X などを合計
+  local pattern=$1; shift
+  awk -v p="$pattern" '$0 ~ p { gsub(/[()]/, "", $0); for (k = 1; k <= NF; k++) if ($k == "per") s += $(k - 1) } END { printf "%.2f\n", s + 0 }' "$@"
+}
+
+ignored_errors() {
+  awk '/ignored errors:/ { s += $3 } END { print s + 0 }' "$@"
+}
+
+cmd_sweep() {
+  local scenario=s1 threads="1 2 4 8 16 32 64 128 256" time=180 warmup=60 repeat=1 rows=100000
+  local hot_id=0 batch=1 rate=0 lua=lab_update.lua label=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --scenario) scenario=$2; shift 2 ;;
+      --threads) threads=$2; shift 2 ;;
+      --time) time=$2; shift 2 ;;
+      --warmup) warmup=$2; shift 2 ;;
+      --repeat) repeat=$2; shift 2 ;;
+      --rows) rows=$2; shift 2 ;;
+      --hot-id) hot_id=$2; shift 2 ;;
+      --batch) batch=$2; shift 2 ;;
+      --rate) rate=$2; shift 2 ;;
+      --select1) lua=lab_select1.lua; shift ;;
+      --label) label=$2; shift 2 ;;
+      -h | --help) usage_sweep; exit 0 ;;
+      *) usage_sweep; die "sweep: 不明な引数 $1" ;;
+    esac
+  done
+  wait_for_db
+
+  # 動かすシャード。ホットスポットは id の持ち主のシャードだけ
+  local -a active=()
+  if [[ $hot_id -gt 0 ]]; then
+    active=($(((hot_id - 1) % NSHARDS)))
+  else
+    active=("${!SHARD_KEYS[@]}")
+  fi
+  local nact=${#active[@]}
+
+  local run_id
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-${scenario}-${NSHARDS}shard-${DB_INSTANCE_CLASS:-local}"
+  local dir="$RESULTS_ROOT/$run_id"
+  mkdir -p "$dir"
+  local summary="$dir/summary.csv"
+  echo "run_id,scenario,label,step,repeat,threads_total,threads_per_shard,shards,instance_class,tps,p95_ms,p99_ms,ignored_errors,loadgen_cpu_pct,valid,start_utc,end_utc" >"$summary"
+
+  {
+    echo "run_id=$run_id"
+    echo "scenario=$scenario label=$label"
+    echo "shards=${SHARDS:-a} active=$(for i in "${active[@]}"; do printf '%s ' "${SHARD_KEYS[$i]}"; done)"
+    echo "instance_class=${DB_INSTANCE_CLASS:-unknown} engine_version=${DB_ENGINE_VERSION:-unknown}"
+    echo "threads=[$threads] time=$time warmup=$warmup repeat=$repeat rows=$rows hot_id=$hot_id batch=$batch rate=$rate lua=$lua"
+    echo "task_cpu=${TASK_CPU:-unknown} nproc=$(nproc)"
+    echo "sysbench=$(sysbench --version)"
+    if [[ -n "${ECS_CONTAINER_METADATA_URI_V4:-}" ]]; then
+      echo "task_metadata:"
+      curl -sf "${ECS_CONTAINER_METADATA_URI_V4}" | jq -c '{Image, ImageID}' || true
+      curl -sf "${ECS_CONTAINER_METADATA_URI_V4}/task" | jq -c '{TaskARN, AvailabilityZone, Limits}' || true
+    fi
+  } >"$dir/meta.txt"
+  cat "$dir/meta.txt" >&2
+
+  local step=0 t r
+  for t in $threads; do
+    step=$((step + 1))
+    # 合計スレッド数をシャードに均等に割る（1 未満にはしない）
+    local per=$(((t + nact - 1) / nact))
+    local rate_per=0
+    [[ $rate -gt 0 ]] && rate_per=$(((rate + nact - 1) / nact))
+    for r in $(seq 1 "$repeat"); do
+      local tag
+      tag=$(printf 'step%02d-t%03d-r%d' "$step" "$t" "$r")
+      local -a common
+      common=(--threads="$per" --rate="$rate_per" --mysql-ignore-errors=1205,1213
+        --rows="$rows" --nshards="$NSHARDS" --hot_id="$hot_id" --batch="$batch")
+
+      if [[ $warmup -gt 0 ]]; then
+        log "$tag warmup ${warmup}s"
+        local i
+        for i in "${active[@]}"; do
+          # shellcheck disable=SC2046
+          sysbench "$LUA_DIR/$lua" $(sysbench_args "$i") "${common[@]}" --shard_index="$i" \
+            --time="$warmup" run >/dev/null 2>&1 &
+        done
+        wait || true
+      fi
+
+      log "$tag measure ${time}s (threads ${t} = ${per} x ${nact} shard)"
+      local start end
+      start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      mpstat 1 "$time" >"$dir/$tag-mpstat.txt" 2>&1 &
+      local mp=$!
+      local -a outs=()
+      for i in "${active[@]}"; do
+        local out="$dir/$tag-${SHARD_KEYS[$i]}.txt"
+        outs+=("$out")
+        # shellcheck disable=SC2046
+        sysbench "$LUA_DIR/$lua" $(sysbench_args "$i") "${common[@]}" --shard_index="$i" \
+          --time="$time" --report-interval=1 --histogram=on --percentile=99 run >"$out" 2>&1 &
+      done
+      wait $(jobs -p | grep -v "^${mp}$") || log "WARN: sysbench が異常終了（$tag の出力を確認）"
+      wait "$mp" || true
+      end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+      local tps pcts p95 p99 errs cpu valid
+      tps=$(sum_field "transactions:" "${outs[@]}")
+      pcts=$(percentiles "${outs[@]}")
+      p95=${pcts% *}
+      p99=${pcts#* }
+      errs=$(ignored_errors "${outs[@]}")
+      # mpstat の Average 行の %idle（最終列）から負荷側 CPU 使用率を出す
+      cpu=$(awk '/^Average:/ && $2 == "all" { printf "%.1f", 100 - $NF }' "$dir/$tag-mpstat.txt")
+      valid=yes
+      awk -v c="${cpu:-0}" 'BEGIN { exit !(c > 70) }' && valid="no(loadgen-cpu>70%)"
+      echo "$run_id,$scenario,$label,$step,$r,$t,$per,$nact,${DB_INSTANCE_CLASS:-unknown},$tps,$p95,$p99,$errs,${cpu:-NA},$valid,$start,$end" >>"$summary"
+      log "$tag tps=$tps p95=${p95}ms p99=${p99}ms errors=$errs loadgen_cpu=${cpu}% valid=$valid"
+      upload "$run_id"
+    done
+  done
+
+  log "done: $run_id"
+  column -s, -t <"$summary" >&2 2>/dev/null || cat "$summary" >&2
+  [[ -n "${RESULTS_BUCKET:-}" ]] && log "results: s3://${RESULTS_BUCKET}/runs/$run_id/"
+  return 0
+}
+
+# ---------------------------------------------------------------- idle / sql
+cmd_idle() {
+  local max=${IDLE_MAX_SECONDS:-3600}
+  log "idle: ECS Exec で入って操作する。${max} 秒後に自動で終了する（止め忘れ防止）"
+  sleep "$max"
+}
+
+cmd_sql() {
+  local key=${1:?shard を指定（例: lab sql a）}; shift
+  local i
+  for i in "${!SHARD_KEYS[@]}"; do
+    if [[ ${SHARD_KEYS[$i]} == "$key" ]]; then
+      mysql_shard "$i" "$DB_NAME" "$@"
+      return
+    fi
+  done
+  die "shard $key は無い（SHARDS=${SHARDS:-a}）"
+}
+
+main() {
+  local cmd=${1:-idle}
+  shift || true
+  case $cmd in
+    idle) cmd_idle "$@" ;;
+    prepare) cmd_prepare "$@" ;;
+    sweep) cmd_sweep "$@" ;;
+    sums) wait_for_db; cmd_sums ;;
+    sql) cmd_sql "$@" ;;
+    *) die "不明なコマンド: $cmd（idle / prepare / sweep / sums / sql）" ;;
+  esac
+}
+
+main "$@"

@@ -70,3 +70,15 @@ variable "service_linked_role_services" {
   type        = list(string)
   default     = ["rds.amazonaws.com", "ecs.amazonaws.com"]
 }
+
+variable "budget_email" {
+  description = "予算アラートの送り先。空なら予算を作らない（tfvars は .gitignore 済みなので公開されない）"
+  type        = string
+  default     = ""
+}
+
+variable "budget_limit_usd" {
+  description = "月額予算（USD）。計画書の見積もりは合計約 $8"
+  type        = number
+  default     = 30
+}

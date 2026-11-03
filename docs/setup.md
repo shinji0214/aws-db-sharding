@@ -9,8 +9,10 @@ AWS の認証はアクセスキーを使わず OIDC。コマンドは Windows Po
 |---|---|---|---|---|
 | `terraform/github-oidc` | GitHub Actions の OIDC プロバイダ（アカウント共通） | 手元PC | 手元 | 消さない |
 | `terraform/bootstrap` | state バケット、plan / apply ロール | 手元PC | 手元 | 検証が全部終わったら |
-| `terraform/base` | VPC など、作業日をまたいで残すもの | Actions | S3 | 検証が全部終わったら |
+| `terraform/base` | VPC・SG・NACL、負荷ツールの ECR、結果の S3、ログなど作業日をまたいで残すもの | Actions | S3 | 検証が全部終わったら |
 | `terraform/db` | Aurora、負荷生成の ECS（Fargate）など課金の大きいもの | Actions | S3 | 作業日ごと |
+
+検証そのものの手順（作業日の流れ、負荷の掛け方、結果の回収）は [experiment.md](experiment.md)。
 
 | ロール | 使う場面 | 入れる条件 | 権限 |
 |---|---|---|---|
@@ -19,7 +21,7 @@ AWS の認証はアクセスキーを使わず OIDC。コマンドは Windows Po
 
 ## 費用
 
-- github-oidc / bootstrap / base（VPC のみ）: ほぼ 0 円。S3 の state は数 KB で月 1 円未満
+- github-oidc / bootstrap / base: ほぼ 0 円（時間課金のリソースを置かない）。ECR のイメージと結果の S3 で月 $1 未満
 - 課金の中心は db スタック（Aurora）。作業が終わったら必ず `db` を destroy する
 - 負荷生成は ECS Fargate のタスクを測定のたびに起動する。課金はタスクが動いている間だけ（秒単位）
 - NAT Gateway は時間課金が大きいので作らない方針。Fargate タスクは public サブネットにパブリック IP 付きで置き、
@@ -79,11 +81,15 @@ terraform plan    # No changes になることを確認（ロールの信頼ポ�
 
 ```powershell
 cd terraform/bootstrap
-copy terraform.tfvars.example terraform.tfvars   # <OWNER> などを埋める（tfvars は .gitignore 済み）
+copy terraform.tfvars.example terraform.tfvars   # <OWNER> や budget_email を埋める（tfvars は .gitignore 済み）
 terraform init
-terraform plan    # S3 バケット・ロール2つ・ポリシーが作られる。OIDC プロバイダは作られない（data で参照）
+terraform plan    # S3 バケット・ロール2つ・ポリシー・予算が作られる。OIDC プロバイダは作られない（data で参照）
 terraform apply
 ```
+
+予算アラート（月 $30、50% / 100% / 予測 100% でメール）はタグ `Project=db-sharding-aws` の費用だけを数える。
+同じアカウントのハニーポットの費用を混ぜないため。タグで絞るには、Billing → **Cost allocation tags** で
+`Project` を有効化しておく（反映まで最大 24 時間。有効化より前の費用は集計されないので、構築の前日までに）。
 
 apply ロールの権限は `variables.tf` の既定値（Aurora・VPC・ECS Fargate・ECR・監視向け）。
 db スタックを作っていて `AccessDenied ... <action>` が出たら、変数に足して手元PCで再 apply する。
@@ -118,8 +124,17 @@ gh actions-lock                               # .github/workflows/actions.lock �
 ## 5. 動作確認
 
 1. Actions → **接続確認（OIDC whoami）** → Run workflow（main）。`sub` と `assumed-role/db-sharding-aws-gha-plan/...` が出れば OK
-2. **構築・削除（Terraform）** → stack `base` / action `plan`。リソースがまだ無いので `No changes` になれば経路は正常
-3. 同じく `apply` → 承認 → 成功すれば apply ロールも正常
+2. **構築・削除（Terraform）** → stack `base` / action `plan`。VPC・サブネット・ECR・S3 などの作成予定が出れば plan ロールは正常
+3. 同じく `apply` → 承認 → 成功すれば apply ロールも正常（base は時間課金のリソースを含まない）
+
+## 6. 負荷ツールのイメージを作る
+
+base の apply の後に1回。`loadgen/` を変えたらもう一度。
+
+1. Actions → **負荷ツールのイメージ作成** → Run workflow（main）→ 承認
+2. ARM64 のランナーでビルドし、ECR の `db-sharding-aws/loadgen` に `latest` とコミット SHA のタグで push される
+
+ここまでで準備は完了。db スタックの apply と測定は [experiment.md](experiment.md) の手順で進める。
 
 ## このリポジトリは public
 
@@ -130,7 +145,9 @@ gh actions-lock                               # .github/workflows/actions.lock �
 ## 片付け
 
 1. 作業日の終わり: Actions で `db` を destroy
-2. 検証が全部終わったら: Actions で `base` を destroy（db → base の順）
+2. 検証が全部終わったら: `.\scripts\loadgen.ps1 -Sync` で結果を回収し、`terraform/base/variables.tf` の
+   `results_force_destroy` を true にしてから Actions で `base` を destroy（db → base の順。false のままだと
+   結果バケットが空でないため destroy が止まる。回収忘れを防ぐための既定値）
 3. 手動で作ったもの（スナップショット等）を削除
 4. 手元PCで `terraform/bootstrap` を `terraform destroy`（state バケットは中身ごと消える）
 5. `terraform/github-oidc` は残す（他プロジェクトの Actions も使う）
