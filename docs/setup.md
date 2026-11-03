@@ -10,18 +10,23 @@ AWS の認証はアクセスキーを使わず OIDC。コマンドは Windows Po
 | `terraform/github-oidc` | GitHub Actions の OIDC プロバイダ（アカウント共通） | 手元PC | 手元 | 消さない |
 | `terraform/bootstrap` | state バケット、plan / apply ロール | 手元PC | 手元 | 検証が全部終わったら |
 | `terraform/base` | VPC など、作業日をまたいで残すもの | Actions | S3 | 検証が全部終わったら |
-| `terraform/db` | Aurora、負荷用 EC2 など課金の大きいもの | Actions | S3 | 作業日ごと |
+| `terraform/db` | Aurora、負荷生成の ECS（Fargate）など課金の大きいもの | Actions | S3 | 作業日ごと |
 
 | ロール | 使う場面 | 入れる条件 | 権限 |
 |---|---|---|---|
 | `db-sharding-aws-gha-plan` | plan・whoami | main ブランチのワークフロー | ReadOnlyAccess |
-| `db-sharding-aws-gha-apply` | apply・destroy | Environment `db-sharding-aws-apply` の承認済みジョブ | rds / ec2 / 監視など必要な分だけ |
+| `db-sharding-aws-gha-apply` | apply・destroy | Environment `db-sharding-aws-apply` の承認済みジョブ | rds / ec2 / ecs / ecr / 監視など必要な分だけ |
 
 ## 費用
 
 - github-oidc / bootstrap / base（VPC のみ）: ほぼ 0 円。S3 の state は数 KB で月 1 円未満
-- 課金の中心は db スタック（Aurora・EC2）。作業が終わったら必ず `db` を destroy する
-- NAT Gateway は時間課金が大きいので作らない方針（負荷用 EC2 には Session Manager の VPC エンドポイントか public サブネットで入る。db スタック作成時に決める）
+- 課金の中心は db スタック（Aurora）。作業が終わったら必ず `db` を destroy する
+- 負荷生成は ECS Fargate のタスクを測定のたびに起動する。課金はタスクが動いている間だけ（秒単位）
+- NAT Gateway は時間課金が大きいので作らない方針。Fargate タスクは public サブネットにパブリック IP 付きで置き、
+  インバウンドはすべて閉じる（ECR からのイメージ取得とログ送信のため。VPC エンドポイントは1つごとに時間課金がある）
+
+📝 学習メモ: 負荷生成側が先に詰まると DB の限界を測れない。タスクの CPU 使用率（Container Insights）も一緒に記録し、
+足りなければタスク数を増やす
 
 ## 0. 決めたこと
 
@@ -80,7 +85,7 @@ terraform plan    # S3 バケット・ロール2つ・ポリシーが作られ�
 terraform apply
 ```
 
-apply ロールの権限は `variables.tf` の既定値（Aurora・EC2・監視向け）。
+apply ロールの権限は `variables.tf` の既定値（Aurora・VPC・ECS Fargate・ECR・監視向け）。
 db スタックを作っていて `AccessDenied ... <action>` が出たら、変数に足して手元PCで再 apply する。
 
 ## 3. GitHub に登録
