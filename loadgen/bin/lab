@@ -230,14 +230,24 @@ cmd_sweep() {
   } >"$dir/meta.txt"
   cat "$dir/meta.txt" >&2
 
-  local step=0 t r
-  for t in $threads; do
-    step=$((step + 1))
+  # 段階番号 → その段階の同時スレッド数（全シャード合計）の対応表
+  #   --threads "1 2 4" なら THREADS_BY_STEP[1]=1, [2]=2, [3]=4
+  local -a THREADS_BY_STEP=()
+  local v
+  for v in $threads; do THREADS_BY_STEP+=("$v"); done
+  local nsteps=${#THREADS_BY_STEP[@]}
+  [[ $nsteps -gt 0 ]] || die "sweep: --threads が空"
+  THREADS_BY_STEP=("" "${THREADS_BY_STEP[@]}") # 1 始まりにする（[0] は使わない）
+  log "steps: $(for ((s = 1; s <= nsteps; s++)); do printf '%d=%s ' "$s" "${THREADS_BY_STEP[$s]}"; done)"
+
+  local step t r
+  for ((step = 1; step <= nsteps; step++)); do
+    t=${THREADS_BY_STEP[$step]}
     # 合計スレッド数をシャードに均等に割る（1 未満にはしない）
     local per=$(((t + nact - 1) / nact))
     local rate_per=0
     [[ $rate -gt 0 ]] && rate_per=$(((rate + nact - 1) / nact))
-    for r in $(seq 1 "$repeat"); do
+    for ((r = 1; r <= repeat; r++)); do
       local tag
       tag=$(printf 'step%02d-t%03d-r%d' "$step" "$t" "$r")
       local -a common
