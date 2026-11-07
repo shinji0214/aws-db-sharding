@@ -31,6 +31,10 @@ $compensate = isset($opt['compensate']);       // missing-buyer のとき、売�
 if (!in_array($mode, ['naive', 'xa'], true)) fail("--mode は naive か xa");
 if (!in_array($order, ['seller-first', 'buyer-first'], true)) fail("--order は seller-first か buyer-first");
 if (!in_array($fault, ['none', 'crash-between', 'crash-after-prepare', 'missing-buyer'], true)) fail("--fault が不正: $fault");
+if ($fault === 'crash-between' && $mode !== 'naive') fail('crash-between は --mode naive 用');
+if ($fault === 'crash-after-prepare' && $mode !== 'xa') fail('crash-after-prepare は --mode xa 用');
+if ($compensate && ($mode !== 'naive' || $order !== 'seller-first')) fail('--compensate は --mode naive --order seller-first 用');
+if ($faultAt < 1) fail('--fault-at は 1 以上');
 
 function fail(string $msg): never
 {
@@ -102,6 +106,11 @@ final class Router
 
 /** 2つのシャードのうち片方だけが確定した（または分からない）。整合性が崩れた可能性がある */
 final class HalfDone extends RuntimeException
+{
+}
+
+/** XA の第2段階（COMMIT）が途中で失敗した。準備済みのまま残った側を後から XA RECOVER で COMMIT する必要がある */
+final class XaInDoubt extends RuntimeException
 {
 }
 
@@ -189,25 +198,59 @@ function tradeSameShard(PDO $db, string $tradeId, int $seller, int $buyer, int $
 
 /**
  * 別シャード・素朴版: 2つのシャードを順番に COMMIT する。
- *   seller-first: 売り手側（アイテムを消す）→ 買い手側（アイテムを作る）。間で落ちると「消失」
- *   buyer-first : 買い手側（アイテムを作る）→ 売り手側（アイテムを消す）。間で落ちると「増殖」
+ *   seller-first: 売り手側（アイテムを消す）を COMMIT → 買い手側（アイテムを作る）を COMMIT。間で落ちると「消失」
+ *   buyer-first : 売り手のアイテムをロックしてから、買い手側（アイテムを作る）を COMMIT → 売り手側（アイテムを消す）を COMMIT。
+ *                 間で落ちると、売り手側は ROLLBACK されてアイテムが残るので「増殖」
+ * どちらも最初に売り手のアイテムを FOR UPDATE でロックするので、落ちなければ同じアイテムが二重に売られることはない
  */
 function tradeNaive(Router $r, string $tradeId, int $seller, int $buyer, int $item, int $price, string $itemType,
                     string $order, bool $crashBetween, bool $compensate): void
 {
     $sellerDb = $r->db($r->shardOf($seller));
     $buyerDb  = $r->db($r->shardOf($buyer));
-    $doSeller = function () use ($sellerDb, $tradeId, $seller, $buyer, $item, $price) {
+
+    if ($order === 'seller-first') {
+        // 1つ目: 売り手側を確定する
         $sellerDb->beginTransaction();
         try {
             sellerSide($sellerDb, $tradeId, $seller, $buyer, $item, $price);
             $sellerDb->commit();
         } catch (Throwable $e) {
             if ($sellerDb->inTransaction()) $sellerDb->rollBack();
-            throw $e;
+            throw $e;               // 何も確定していないので、ただの失敗
         }
-    };
-    $doBuyer = function () use ($buyerDb, $tradeId, $seller, $buyer, $item, $price, $itemType) {
+        // ここで売り手側は確定済み。もう取り消せない
+        if ($crashBetween) crash('売り手側の COMMIT 直後（seller-first）');
+
+        // 2つ目: 買い手側
+        $buyerDb->beginTransaction();
+        try {
+            buyerSide($buyerDb, $tradeId, $seller, $buyer, $item, $price, $itemType);
+            $buyerDb->commit();
+        } catch (TradeRejected $e) {
+            $buyerDb->rollBack();
+            // 業務エラー（買い手がいない等）。補償処理が無ければ売り手側の変更がそのまま残る
+            if ($compensate) {
+                compensateSeller($sellerDb, $tradeId, $seller, $item, $price, $itemType);
+                throw new TradeRejected('買い手側で失敗したので、売り手側を補償処理で元に戻した');
+            }
+            throw new HalfDone('買い手側で失敗。売り手側は確定したまま: ' . $e->getMessage());
+        } catch (Throwable $e) {
+            if ($buyerDb->inTransaction()) { try { $buyerDb->rollBack(); } catch (Throwable) {} }
+            // ネットワーク断・再起動など。買い手側が反映されたかどうかも分からない
+            throw new HalfDone('買い手側で DB エラー（反映されたか不明）: ' . $e->getMessage());
+        }
+        return;
+    }
+
+    // buyer-first: 先に売り手のアイテムをロックして、売り手側のトランザクションを開いたままにする
+    $sellerDb->beginTransaction();
+    try {
+        $st = $sellerDb->prepare('SELECT owner_id FROM items WHERE item_uid = ? FOR UPDATE');
+        $st->execute([$item]);
+        if ((int)$st->fetchColumn() !== $seller) throw new TradeRejected('売り手がもうそのアイテムを持っていない');
+
+        // 1つ目: 買い手側を確定する（失敗したら売り手側も ROLLBACK するだけ。何も変わらない）
         $buyerDb->beginTransaction();
         try {
             buyerSide($buyerDb, $tradeId, $seller, $buyer, $item, $price, $itemType);
@@ -216,34 +259,39 @@ function tradeNaive(Router $r, string $tradeId, int $seller, int $buyer, int $it
             if ($buyerDb->inTransaction()) $buyerDb->rollBack();
             throw $e;
         }
-    };
+    } catch (Throwable $e) {
+        if ($sellerDb->inTransaction()) $sellerDb->rollBack();
+        throw $e;
+    }
+    // ここで買い手側は確定済み（アイテムが買い手にも存在する）
+    if ($crashBetween) crash('買い手側の COMMIT 直後（buyer-first）');
 
-    [$first, $second] = $order === 'seller-first' ? [$doSeller, $doBuyer] : [$doBuyer, $doSeller];
-    $first();                       // ここで1つ目のシャードは確定済み。もう取り消せない
-    if ($crashBetween) crash("1つ目のシャードの COMMIT 直後（$order）");
+    // 2つ目: 売り手側を確定する（ロックは握ったままなので、アイテムはまだ売り手のもの）
     try {
-        $second();
-    } catch (TradeRejected $e) {
-        // 2つ目で業務エラー（買い手がいない等）。補償処理が無ければ1つ目の変更がそのまま残る
-        if ($compensate && $order === 'seller-first') {
-            compensateSeller($sellerDb, $tradeId, $seller, $item, $price, $itemType);
-            throw new TradeRejected('買い手側で失敗したので、売り手側を補償処理で元に戻した');
-        }
-        throw new HalfDone('2つ目のシャードで失敗。1つ目の変更は確定したまま: ' . $e->getMessage());
-    } catch (PDOException $e) {
-        // ネットワーク断・再起動など。2つ目が反映されたかどうかも分からない
-        throw new HalfDone('2つ目のシャードで DB エラー（反映されたか不明）: ' . $e->getMessage());
+        $sellerDb->prepare('DELETE FROM items WHERE item_uid = ?')->execute([$item]);
+        $sellerDb->prepare('UPDATE players SET gold = gold + ?, updated_at = NOW() WHERE player_id = ?')->execute([$price, $seller]);
+        logRow($sellerDb, $tradeId, 'seller', $seller, $buyer, $item, $price);
+        $sellerDb->commit();
+    } catch (Throwable $e) {
+        if ($sellerDb->inTransaction()) { try { $sellerDb->rollBack(); } catch (Throwable) {} }
+        throw new HalfDone('売り手側で DB エラー。買い手側は確定したまま（アイテムが2つある可能性）: ' . $e->getMessage());
     }
 }
 
 /** 補償処理: 売り手側の変更を逆向きの操作で打ち消す（アイテムを戻し、代金を返す） */
 function compensateSeller(PDO $db, string $tradeId, int $seller, int $item, int $price, string $itemType): void
 {
-    $db->beginTransaction();
-    $db->prepare('INSERT INTO items (item_uid, owner_id, item_type) VALUES (?, ?, ?)')->execute([$item, $seller, $itemType]);
-    $db->prepare('UPDATE players SET gold = gold - ?, updated_at = NOW() WHERE player_id = ?')->execute([$price, $seller]);
-    $db->prepare('DELETE FROM trade_log WHERE trade_id = ? AND side = ?')->execute([$tradeId, 'seller']);
-    $db->commit();
+    try {
+        $db->beginTransaction();
+        $db->prepare('INSERT INTO items (item_uid, owner_id, item_type) VALUES (?, ?, ?)')->execute([$item, $seller, $itemType]);
+        $db->prepare('UPDATE players SET gold = gold - ?, updated_at = NOW() WHERE player_id = ?')->execute([$price, $seller]);
+        $db->prepare('DELETE FROM trade_log WHERE trade_id = ? AND side = ?')->execute([$tradeId, 'seller']);
+        $db->commit();
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) { try { $db->rollBack(); } catch (Throwable) {} }
+        // 補償処理そのものが失敗した。売り手側の変更は残ったまま
+        throw new HalfDone('補償処理に失敗。売り手側は確定したまま: ' . $e->getMessage());
+    }
 }
 
 /**
@@ -260,6 +308,7 @@ function tradeXa(Router $r, string $tradeId, int $seller, int $buyer, int $item,
     $xid = "'" . $tradeId . "'";    // uuid なので SQL に埋め込んでも安全
     $prepared = [];                 // PREPARE まで済んだシャードの接続
 
+    // --- 第1段階
     try {
         foreach ([[$sellerDb, 'seller'], [$buyerDb, 'buyer']] as [$db, $side]) {
             $db->exec("XA START $xid");
@@ -270,28 +319,40 @@ function tradeXa(Router $r, string $tradeId, int $seller, int $buyer, int $item,
                     buyerSide($db, $tradeId, $seller, $buyer, $item, $price, $itemType);
                 }
                 $db->exec("XA END $xid");
+                $db->exec("XA PREPARE $xid");
             } catch (Throwable $e) {
-                // このシャードは PREPARE 前なので、ここで取り消せる
+                // このシャードは PREPARE 前（または PREPARE 失敗）なので、ここで取り消す
                 try { $db->exec("XA END $xid"); } catch (Throwable) {}
                 try { $db->exec("XA ROLLBACK $xid"); } catch (Throwable) {}
                 throw $e;
             }
-            $db->exec("XA PREPARE $xid");
-            $prepared[] = $db;
+            $prepared[] = [$db, $side];
         }
     } catch (Throwable $e) {
         // 第1段階で失敗: PREPARE 済みの側も取り消して、何も起きなかったことにする
-        foreach ($prepared as $db) {
-            $db->exec("XA ROLLBACK $xid");
+        foreach ($prepared as [$db, $side]) {
+            try {
+                $db->exec("XA ROLLBACK $xid");
+            } catch (Throwable $re) {
+                logmsg("XA ROLLBACK に失敗（$side 側に準備済みが残る。lab xa-recover で片付ける）: " . $re->getMessage());
+            }
         }
         throw $e;
     }
 
     if ($crashAfterPrepare) crash('両シャードの XA PREPARE 直後（COMMIT 前）');
 
-    // 第2段階: ここまで来たら必ず両方 COMMIT する。途中で失敗したら、残った側は XA RECOVER で後から COMMIT する
-    $sellerDb->exec("XA COMMIT $xid");
-    $buyerDb->exec("XA COMMIT $xid");
+    // --- 第2段階: ここまで来たら必ず両方 COMMIT する。失敗した側は準備済みのまま残るので、後から XA RECOVER で COMMIT する
+    $done = [];
+    foreach ([[$sellerDb, 'seller'], [$buyerDb, 'buyer']] as [$db, $side]) {
+        try {
+            $db->exec("XA COMMIT $xid");
+            $done[] = $side;
+        } catch (Throwable $e) {
+            throw new XaInDoubt(sprintf('XA COMMIT に失敗（%s 側。確定済み: %s）: %s',
+                $side, $done ? implode(',', $done) : 'なし', $e->getMessage()));
+        }
+    }
 }
 
 // ------------------------------------------------------------ メインループ
@@ -305,6 +366,8 @@ $counts = [
     'db_error' => 0,         // 1つ目の更新前・XA の第1段階などで DB エラー。何も変わっていない
     'lock_timeout' => 0,     // ロック待ちタイムアウト（1205）。XA で固まった行に当たると増える
     'deadlock' => 0,         // デッドロック（1213）
+    'dup_key' => 0,          // 主キー重複（1062）。同じアイテムが既にある = 増殖が起きている印
+    'xa_in_doubt' => 0,      // XA の COMMIT が途中で失敗（ネットワーク断・再起動など）。準備済みが残る
 ];
 $latency = ['same' => [], 'cross' => []];
 $crossCount = 0;
@@ -363,6 +426,10 @@ while (microtime(true) < $end) {
         $latency[$cross ? 'cross' : 'same'][] = (hrtime(true) - $t0) / 1e6;
     } catch (TradeRejected $e) {
         $counts['rejected']++;
+    } catch (XaInDoubt $e) {
+        $counts['xa_in_doubt']++;
+        logmsg("XA 未確定 trade=$tradeId: " . $e->getMessage());
+        foreach ([$router->shardOf($seller), $router->shardOf($buyer)] as $s) $router->forget($s);
     } catch (HalfDone $e) {
         $counts['half_done']++;
         logmsg("片側だけ確定 trade=$tradeId seller=$seller buyer=$buyer item=$item: " . $e->getMessage());
@@ -373,6 +440,8 @@ while (microtime(true) < $end) {
             $counts['lock_timeout']++;
         } elseif ($code === 1213) {
             $counts['deadlock']++;
+        } elseif ($code === 1062) {
+            $counts['dup_key']++;
         } else {
             $counts['db_error']++;
             logmsg("DB エラー: " . $e->getMessage());

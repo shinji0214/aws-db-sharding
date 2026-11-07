@@ -141,6 +141,11 @@ docker compose down -v
 .\scripts\loadgen.ps1 'trade --mode xa --fault crash-after-prepare --fault-at 50' -Follow
 ```
 
+summary.json の主な項目: `cross_ok`（別シャードで成功）、`half_done`（片側だけ確定、または結果が分からない）、
+`dup_key`（同じアイテムが既にあって INSERT できなかった = 増殖の後に出る）、`lock_timeout`（XA で固まった行に当たった）、
+`xa_in_doubt`（XA の COMMIT が途中で失敗し、準備済みが残った）。どちらの順番でも最初に売り手のアイテムをロックするので、
+障害を入れなければ素朴版でも整合性は保たれる。
+
 障害を入れた試行の後は、次の試行の前に `prepare` で世界を作り直す（崩れたままだと結果が混ざる）。
 XA の後始末は ECS Exec で入って行う（`lab xa-recover` で表示、`--commit` / `--rollback` で片付け）。
 片付けた後に `lab check` で整合性が戻ったことを確かめる。

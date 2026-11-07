@@ -99,6 +99,7 @@ cmd_prepare() {
       *) die "prepare: 不明な引数 $1" ;;
     esac
   done
+  [[ $rows -ge $NSHARDS ]] || die "prepare: --rows はシャード数（${NSHARDS}）以上にする"
   wait_for_db
   local i
   for i in "${!SHARD_KEYS[@]}"; do
@@ -389,6 +390,11 @@ cmd_trade() {
       *) usage_trade; die "trade: 不明な引数 $1" ;;
     esac
   done
+  case "$mode/$fault" in
+    naive/none | naive/crash-between | naive/missing-buyer | xa/none | xa/crash-after-prepare | xa/missing-buyer) ;;
+    *) die "trade: --mode $mode と --fault $fault の組み合わせは使えない（crash-between は naive、crash-after-prepare は xa 用）" ;;
+  esac
+  [[ -z $compensate || ( $mode == naive && $order == seller-first ) ]] || die "trade: --compensate は --mode naive --order seller-first 用"
   wait_for_db
   local rows
   rows=$(meta_value rows) || die "lab_meta が無い。先に lab prepare を実行する"
@@ -432,10 +438,11 @@ cmd_trade() {
     {workers_finished: length, workers_crashed: $crashed,
      same_ok: s("same_ok"), cross_ok: s("cross_ok"), rejected: s("rejected"), half_done: s("half_done"),
      db_error: s("db_error"), lock_timeout: s("lock_timeout"), deadlock: s("deadlock"),
+     dup_key: s("dup_key"), xa_in_doubt: s("xa_in_doubt"),
      trades_per_sec: (((s("same_ok") + s("cross_ok")) / $time) * 10 | round / 10),
      same_p95_ms_max: (map(.same_p95_ms // empty) | max), cross_p95_ms_max: (map(.cross_p95_ms // empty) | max)}' \
     >"$dir/summary.json"
-  grep -h "片側だけ確定\|障害注入" "$dir"/worker-*.log >"$dir/events.txt" 2>/dev/null || true
+  grep -h "片側だけ確定\|障害注入\|XA 未確定\|XA ROLLBACK に失敗" "$dir"/worker-*.log >"$dir/events.txt" 2>/dev/null || true
 
   log "check after"
   cmd_check >"$dir/check-after.txt" 2>&1 || true
@@ -444,6 +451,7 @@ cmd_trade() {
   echo "---- check after" >&2
   cat "$dir/check-after.txt" >&2
   upload "$run_id"
+  log "done: $run_id"
   [[ -n "${RESULTS_BUCKET:-}" ]] && log "results: s3://${RESULTS_BUCKET}/runs/$run_id/"
   return 0
 }
@@ -454,7 +462,7 @@ cmd_check() {
   gold_total=$(meta_value gold_total)
   item_total=$(meta_value item_total)
   tmp=$(mktemp -d)
-  local gold=0 xa=0
+  local gold=0 xa=0 xa_error=no
   for i in "${!SHARD_KEYS[@]}"; do
     local k=${SHARD_KEYS[$i]}
     gold=$((gold + $(mysql_shard "$i" -N -B "$DB_NAME" -e "SELECT IFNULL(SUM(gold), 0) FROM players")))
@@ -463,12 +471,17 @@ cmd_check() {
     local wrong
     wrong=$(mysql_shard "$i" -N -B "$DB_NAME" -e \
       "SELECT COUNT(*) FROM items WHERE (owner_id - 1) % ${NSHARDS} <> ${i} OR owner_id NOT IN (SELECT player_id FROM players)")
-    [[ $wrong -gt 0 ]] && echo "shard $k: 持ち主がこのシャードにいないアイテム ${wrong} 件"
+    if [[ $wrong -gt 0 ]]; then echo "shard $k: 持ち主がこのシャードにいないアイテム ${wrong} 件"; fi
     mysql_shard "$i" -N -B "$DB_NAME" -e "SELECT trade_id, side FROM trade_log WHERE side <> 'same'" >"$tmp/log-$k"
-    local n_xa
-    n_xa=$(mysql_shard "$i" -N -B "$DB_NAME" -e "XA RECOVER" 2>/dev/null | wc -l)
-    xa=$((xa + n_xa))
-    [[ $n_xa -gt 0 ]] && echo "shard $k: 準備済みのまま残った XA トランザクション ${n_xa} 件（lab xa-recover で確認）"
+    local xa_out n_xa
+    if xa_out=$(mysql_shard "$i" -N -B "$DB_NAME" -e "XA RECOVER" 2>&1); then
+      n_xa=$(grep -c . <<<"$xa_out" || true)
+      xa=$((xa + n_xa))
+      if [[ $n_xa -gt 0 ]]; then echo "shard $k: 準備済みのまま残った XA トランザクション ${n_xa} 件（lab xa-recover で確認）"; fi
+    else
+      echo "shard $k: XA RECOVER を実行できない（XA_RECOVER_ADMIN 権限を確認）: $xa_out"
+      xa_error=yes
+    fi
   done
   local all unique dup missing
   all=$(cat "$tmp"/items-* | wc -l)
@@ -482,9 +495,9 @@ cmd_check() {
   echo "ゴールド合計   : ${gold}（初期 ${gold_total}、差 $((gold - gold_total))）"
   echo "アイテム       : ${all} 件（初期 ${item_total}）、増殖 ${dup} 種類、消失 ${missing} 件"
   echo "途中で止まったトレード: ${half} 件（trade_log に片側の記録しかない）"
-  echo "XA 準備済み    : ${xa} 件"
+  echo "XA 準備済み    : ${xa} 件$([[ $xa_error == yes ]] && echo "（確認できないシャードあり）")"
   local ok=yes
-  [[ $gold -ne $gold_total || $dup -ne 0 || $missing -ne 0 || $half -ne 0 || $xa -ne 0 ]] && ok=no
+  [[ $gold -ne $gold_total || $dup -ne 0 || $missing -ne 0 || $half -ne 0 || $xa -ne 0 || $xa_error == yes ]] && ok=no
   echo "整合性         : ${ok}"
   rm -rf "$tmp"
   [[ $ok == yes ]]
