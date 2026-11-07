@@ -2,9 +2,12 @@
 # 負荷生成タスクの入口。ECS の run-task の command（scripts/loadgen.ps1）か、手元の docker compose から呼ぶ。
 #
 #   lab idle                     何もせず待つ（ECS Exec で入って手で操作する用。IDLE_MAX_SECONDS で自動終了）
-#   lab prepare [--rows N]       全シャードにテーブルを作り直してデータを入れる
+#   lab prepare [--rows N]       全シャードにゲームの世界（プレイヤー・アイテム・ワールドボス）を作り直す
 #   lab sweep [options]          スレッド数を段階的に増やして測る（シナリオ1・2・3、SELECT 1 の上限確認）
-#   lab sums                     全シャードの SUM(score)・SUM(balance)・件数（シナリオ4・5の照合用）
+#   lab sums                     全シャードのプレイヤー数・経験値・ゴールド・アイテム数・ボス HP
+#   lab trade [options]          アイテムトレードを並列で流す（シナリオ4・XA。PHP のワーカーを N 本起動）
+#   lab check                    世界の整合性を確かめる（ゴールド合計、アイテムの増殖・消失、途中で止まったトレード、XA）
+#   lab xa-recover [--commit|--rollback]  準備済みのまま残った XA トランザクションを表示・片付ける
 #   lab sql <shard> [mysql args] シャードに mysql クライアントでつなぐ（ECS Exec の中で使う）
 #
 # 接続先は環境変数で受け取る（db スタックのタスク定義が設定する）
@@ -80,11 +83,19 @@ upload() {
 }
 
 # ---------------------------------------------------------------- prepare
+# ゲームの世界を作る。プレイヤーは player_id でシャードに振り分ける（シャード番号 = (player_id - 1) % シャード数）
+#   2シャードなら A = 奇数、B = 偶数。アイテムは持ち主と同じシャードに置く
+#   players    : 経験値（シナリオ1・2で加算）とゴールド（トレードの代金）
+#   items      : 1点もののアイテム。item_uid は世界で1つだけのはず（増殖・消失の判定に使う）
+#   world_boss : 全員で殴るボス（シナリオ3のホットスポット）。boss_id 1 はシャード A にいる
+#   trade_log  : トレードの途中経過（どこまで進んだか）
+#   lab_meta   : 初期のゴールド合計とアイテム数（lab check の照合用。全シャードに同じ値）
 cmd_prepare() {
-  local rows=100000
+  local rows=100000 items_per_player=2 gold=10000
   while [[ $# -gt 0 ]]; do
     case $1 in
       --rows) rows=$2; shift 2 ;;
+      --items-per-player) items_per_player=$2; shift 2 ;;
       *) die "prepare: 不明な引数 $1" ;;
     esac
   done
@@ -93,33 +104,54 @@ cmd_prepare() {
   for i in "${!SHARD_KEYS[@]}"; do
     local first=$((i + 1))
     local cnt=$(((rows - first) / NSHARDS + 1))
-    log "prepare shard=${SHARD_KEYS[$i]} ids=${first},$((first + NSHARDS)),... count=${cnt}"
+    log "prepare shard=${SHARD_KEYS[$i]} player_id=${first},$((first + NSHARDS)),... players=${cnt} items=$((cnt * items_per_player))"
+    local boss_sql=""
+    [[ $i -eq 0 ]] && boss_sql="INSERT INTO world_boss (boss_id, hp) VALUES (1, 1000000000000);"
     mysql_shard "$i" "$DB_NAME" >/dev/null <<SQL
-DROP TABLE IF EXISTS users, accounts, transfer_log;
-CREATE TABLE users (
-  id BIGINT PRIMARY KEY,
-  score BIGINT NOT NULL,
-  updated_at DATETIME NOT NULL
+DROP TABLE IF EXISTS users, accounts, transfer_log, players, items, world_boss, trade_log, lab_meta;
+CREATE TABLE players (
+  player_id BIGINT PRIMARY KEY,
+  exp BIGINT NOT NULL,
+  gold BIGINT NOT NULL,
+  updated_at DATETIME NOT NULL,
+  CHECK (gold >= 0)
 );
-CREATE TABLE accounts (
-  user_id BIGINT PRIMARY KEY,
-  balance BIGINT NOT NULL,
-  CHECK (balance >= 0)
+CREATE TABLE items (
+  item_uid BIGINT PRIMARY KEY,
+  owner_id BIGINT NOT NULL,
+  item_type VARCHAR(32) NOT NULL,
+  KEY (owner_id)
 );
-CREATE TABLE transfer_log (
-  tx_id CHAR(36) PRIMARY KEY,
-  from_user BIGINT NOT NULL,
-  to_user BIGINT NOT NULL,
-  amount BIGINT NOT NULL,
-  state VARCHAR(16) NOT NULL,
-  created_at DATETIME NOT NULL
+CREATE TABLE world_boss (
+  boss_id BIGINT PRIMARY KEY,
+  hp BIGINT NOT NULL
 );
-SET SESSION cte_max_recursion_depth = ${cnt};
-INSERT INTO users (id, score, updated_at)
+CREATE TABLE trade_log (
+  trade_id CHAR(36) NOT NULL,
+  side VARCHAR(8) NOT NULL,
+  seller BIGINT NOT NULL,
+  buyer BIGINT NOT NULL,
+  item_uid BIGINT NOT NULL,
+  price BIGINT NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (trade_id, side)
+);
+CREATE TABLE lab_meta (
+  k VARCHAR(32) PRIMARY KEY,
+  v BIGINT NOT NULL
+);
+SET SESSION cte_max_recursion_depth = $((cnt * items_per_player + 1));
+INSERT INTO players (player_id, exp, gold, updated_at)
   WITH RECURSIVE k (n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM k WHERE n + 1 < ${cnt})
-  SELECT ${first} + ${NSHARDS} * n, 0, NOW() FROM k;
-INSERT INTO accounts (user_id, balance) SELECT id, 10000 FROM users;
-ANALYZE TABLE users, accounts;
+  SELECT ${first} + ${NSHARDS} * n, 0, ${gold}, NOW() FROM k;
+-- アイテム: プレイヤー p の j 個目（j = 0 ..）は item_uid = (p - 1) * items_per_player + j + 1
+INSERT INTO items (item_uid, owner_id, item_type)
+  WITH RECURSIVE k (n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM k WHERE n + 1 < $((cnt * items_per_player)))
+  SELECT (p - 1) * ${items_per_player} + j + 1, p, ELT(1 + (p + j) % 4, 'sword', 'shield', 'bow', 'staff')
+  FROM (SELECT ${first} + ${NSHARDS} * (n DIV ${items_per_player}) AS p, n MOD ${items_per_player} AS j FROM k) t;
+${boss_sql}
+INSERT INTO lab_meta (k, v) VALUES ('gold_total', ${rows} * ${gold}), ('item_total', ${rows} * ${items_per_player}), ('rows', ${rows});
+ANALYZE TABLE players, items;
 SQL
   done
   cmd_sums
@@ -128,11 +160,12 @@ SQL
 # ---------------------------------------------------------------- sums
 cmd_sums() {
   local i
-  printf '%-6s %10s %15s %15s\n' shard rows sum_score sum_balance
+  printf '%-6s %10s %15s %15s %10s %16s\n' shard players sum_exp sum_gold items boss_hp
   for i in "${!SHARD_KEYS[@]}"; do
     mysql_shard "$i" -N -B "$DB_NAME" -e \
-      "SELECT '${SHARD_KEYS[$i]}', COUNT(*), SUM(score), (SELECT SUM(balance) FROM accounts) FROM users" |
-      awk '{printf "%-6s %10s %15s %15s\n", $1, $2, $3, $4}'
+      "SELECT '${SHARD_KEYS[$i]}', COUNT(*), SUM(exp), SUM(gold), (SELECT COUNT(*) FROM items),
+              IFNULL((SELECT hp FROM world_boss WHERE boss_id = 1), '-') FROM players" |
+      awk '{printf "%-6s %10s %15s %15s %10s %16s\n", $1, $2, $3, $4, $5, $6}'
   done
 }
 
@@ -146,7 +179,7 @@ lab sweep [options]
   --warmup SEC      各段階の前のウォームアップ秒数（結果に含めない）。既定 60
   --repeat N        各段階の繰り返し回数（飽和点付近の再測定用）。既定 1
   --rows N          prepare した合計行数。既定 100000
-  --hot-id ID       ホットスポット（シナリオ3）。この id を持つシャードだけに全スレッドを向ける
+  --boss ID         ホットスポット（シナリオ3）。全スレッドでワールドボス ID の HP を削る（ボスがいるシャードだけに向ける）
   --batch N         1トランザクションの UPDATE 件数。既定 1（自動コミット）
   --rate TPS        固定レート（全シャード合計）。0 = 上限まで。既定 0
   --select1         UPDATE の代わりに SELECT 1（負荷側の上限確認）
@@ -184,7 +217,7 @@ ignored_errors() {
 
 cmd_sweep() {
   local scenario=s1 threads="" time=180 warmup=60 repeat=1 rows=100000
-  local hot_id=0 batch=1 rate=0 lua=lab_update.lua label=""
+  local boss=0 batch=1 rate=0 lua=lab_update.lua label=""
   while [[ $# -gt 0 ]]; do
     case $1 in
       --scenario) scenario=$2; shift 2 ;;
@@ -193,7 +226,7 @@ cmd_sweep() {
       --warmup) warmup=$2; shift 2 ;;
       --repeat) repeat=$2; shift 2 ;;
       --rows) rows=$2; shift 2 ;;
-      --hot-id) hot_id=$2; shift 2 ;;
+      --boss) boss=$2; shift 2 ;;
       --batch) batch=$2; shift 2 ;;
       --rate) rate=$2; shift 2 ;;
       --select1) lua=lab_select1.lua; shift ;;
@@ -204,10 +237,10 @@ cmd_sweep() {
   done
   wait_for_db
 
-  # 動かすシャード。ホットスポットは id の持ち主のシャードだけ
+  # 動かすシャード。ホットスポットはボスがいるシャードだけ（boss_id もプレイヤーと同じ規則で振り分ける）
   local -a active=()
-  if [[ $hot_id -gt 0 ]]; then
-    active=($(((hot_id - 1) % NSHARDS)))
+  if [[ $boss -gt 0 ]]; then
+    active=($(((boss - 1) % NSHARDS)))
   else
     active=("${!SHARD_KEYS[@]}")
   fi
@@ -225,7 +258,7 @@ cmd_sweep() {
     echo "scenario=$scenario label=$label"
     echo "shards=${SHARDS:-a} active=$(for i in "${active[@]}"; do printf '%s ' "${SHARD_KEYS[$i]}"; done)"
     echo "instance_class=${DB_INSTANCE_CLASS:-unknown} engine_version=${DB_ENGINE_VERSION:-unknown}"
-    echo "threads=[${threads:-default}] time=$time warmup=$warmup repeat=$repeat rows=$rows hot_id=$hot_id batch=$batch rate=$rate lua=$lua"
+    echo "threads=[${threads:-default}] time=$time warmup=$warmup repeat=$repeat rows=$rows boss=$boss batch=$batch rate=$rate lua=$lua"
     echo "task_cpu=${TASK_CPU:-unknown} nproc=$(nproc)"
     echo "sysbench=$(sysbench --version)"
     if [[ -n "${ECS_CONTAINER_METADATA_URI_V4:-}" ]]; then
@@ -265,7 +298,7 @@ cmd_sweep() {
       tag=$(printf 'step%02d-t%03d-r%d' "$step" "$t" "$r")
       local -a common
       common=(--threads="$per" --rate="$rate_per" --mysql-ignore-errors=1205,1213
-        --rows="$rows" --nshards="$NSHARDS" --hot_id="$hot_id" --batch="$batch")
+        --rows="$rows" --nshards="$NSHARDS" --boss="$boss" --batch="$batch")
 
       if [[ $warmup -gt 0 ]]; then
         log "$tag warmup ${warmup}s"
@@ -317,6 +350,169 @@ cmd_sweep() {
   return 0
 }
 
+# ---------------------------------------------------------------- trade / check / xa-recover
+usage_trade() {
+  cat >&2 <<'EOF'
+lab trade [options]
+  --mode naive|xa      別シャード間のトレードの書き方。naive = 順番に COMMIT、xa = 2相コミット。既定 naive
+  --order seller-first|buyer-first  naive で先に更新する側。seller-first = 消失、buyer-first = 増殖が起き得る
+  --workers N          並列に動かす PHP ワーカー数。既定 8
+  --time SEC           実行秒数。既定 60
+  --fault KIND         ワーカー1に入れる障害。既定 none
+                         crash-between       naive: 1つ目のシャードの COMMIT 直後に強制終了（1回）
+                         crash-after-prepare xa: 両シャードの PREPARE 直後に強制終了（1回）
+                         missing-buyer       存在しない買い手とトレードする（--fault-at 回ごと）
+  --fault-at N         何回目のクロスシャードトレードで障害を起こすか。既定 50
+  --compensate         missing-buyer のとき、売り手側の変更を補償処理で取り消す（naive・seller-first）
+  --label TEXT         結果に残すメモ
+  ネットワーク断（F3）・DB 再起動（F4）は、実行中に手元から NACL / reboot を操作する（docs/experiment.md）
+EOF
+}
+
+meta_value() { # lab_meta の値（シャード a のものを使う。prepare で全シャードに同じ値を入れている）
+  mysql_shard 0 -N -B "$DB_NAME" -e "SELECT v FROM lab_meta WHERE k = '$1'"
+}
+
+cmd_trade() {
+  local mode=naive order=seller-first workers=8 time=60 fault=none fault_at=50 compensate="" label=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --mode) mode=$2; shift 2 ;;
+      --order) order=$2; shift 2 ;;
+      --workers) workers=$2; shift 2 ;;
+      --time) time=$2; shift 2 ;;
+      --fault) fault=$2; shift 2 ;;
+      --fault-at) fault_at=$2; shift 2 ;;
+      --compensate) compensate=--compensate; shift ;;
+      --label) label=$2; shift 2 ;;
+      -h | --help) usage_trade; exit 0 ;;
+      *) usage_trade; die "trade: 不明な引数 $1" ;;
+    esac
+  done
+  wait_for_db
+  local rows
+  rows=$(meta_value rows) || die "lab_meta が無い。先に lab prepare を実行する"
+
+  local run_id="$(date -u +%Y%m%dT%H%M%SZ)-trade-${mode}-${NSHARDS}shard-${DB_INSTANCE_CLASS:-local}"
+  local dir="$RESULTS_ROOT/$run_id"
+  mkdir -p "$dir"
+  {
+    echo "run_id=$run_id label=$label"
+    echo "mode=$mode order=$order workers=$workers time=$time fault=$fault fault_at=$fault_at compensate=${compensate:-no}"
+    echo "shards=${SHARDS:-a} rows=$rows instance_class=${DB_INSTANCE_CLASS:-unknown} php=$(php -r 'echo PHP_VERSION;')"
+  } >"$dir/meta.txt"
+  cat "$dir/meta.txt" >&2
+
+  log "check before"
+  cmd_check >"$dir/check-before.txt" 2>&1 || true
+  cat "$dir/check-before.txt" >&2
+
+  log "trade ${time}s x ${workers} workers"
+  local w
+  local -a pids=()
+  for ((w = 1; w <= workers; w++)); do
+    php -d mysqlnd.net_read_timeout=10 /opt/lab/php/trade.php --mode="$mode" --order="$order" --seconds="$time" \
+      --worker="$w" --rows="$rows" --fault="$fault" --fault-at="$fault_at" $compensate \
+      >"$dir/worker-$w.json" 2>"$dir/worker-$w.log" &
+    pids+=($!)
+  done
+  local crashed=0
+  for w in "${!pids[@]}"; do
+    local rc=0
+    wait "${pids[$w]}" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+      crashed=$((crashed + 1))
+      log "worker $((w + 1)) exit=$rc（137 = 障害注入による強制終了）"
+    fi
+  done
+
+  # ワーカーの集計を合算（強制終了したワーカーは何も出力していない）
+  cat "$dir"/worker-*.json | jq -s --argjson crashed "$crashed" --argjson time "$time" '
+    def s(k): map(.[k] // 0) | add // 0;
+    {workers_finished: length, workers_crashed: $crashed,
+     same_ok: s("same_ok"), cross_ok: s("cross_ok"), rejected: s("rejected"), half_done: s("half_done"),
+     db_error: s("db_error"), lock_timeout: s("lock_timeout"), deadlock: s("deadlock"),
+     trades_per_sec: (((s("same_ok") + s("cross_ok")) / $time) * 10 | round / 10),
+     same_p95_ms_max: (map(.same_p95_ms // empty) | max), cross_p95_ms_max: (map(.cross_p95_ms // empty) | max)}' \
+    >"$dir/summary.json"
+  grep -h "片側だけ確定\|障害注入" "$dir"/worker-*.log >"$dir/events.txt" 2>/dev/null || true
+
+  log "check after"
+  cmd_check >"$dir/check-after.txt" 2>&1 || true
+  echo "---- summary" >&2
+  jq . "$dir/summary.json" >&2
+  echo "---- check after" >&2
+  cat "$dir/check-after.txt" >&2
+  upload "$run_id"
+  [[ -n "${RESULTS_BUCKET:-}" ]] && log "results: s3://${RESULTS_BUCKET}/runs/$run_id/"
+  return 0
+}
+
+# 世界の整合性チェック。NewSQL なら DB が保証してくれることを、アプリ側で確かめる
+cmd_check() {
+  local gold_total item_total tmp i
+  gold_total=$(meta_value gold_total)
+  item_total=$(meta_value item_total)
+  tmp=$(mktemp -d)
+  local gold=0 xa=0
+  for i in "${!SHARD_KEYS[@]}"; do
+    local k=${SHARD_KEYS[$i]}
+    gold=$((gold + $(mysql_shard "$i" -N -B "$DB_NAME" -e "SELECT IFNULL(SUM(gold), 0) FROM players")))
+    mysql_shard "$i" -N -B "$DB_NAME" -e "SELECT item_uid FROM items" >"$tmp/items-$k"
+    # 持ち主が別のシャードにいるアイテム（振り分けの規則が破れている）
+    local wrong
+    wrong=$(mysql_shard "$i" -N -B "$DB_NAME" -e \
+      "SELECT COUNT(*) FROM items WHERE (owner_id - 1) % ${NSHARDS} <> ${i} OR owner_id NOT IN (SELECT player_id FROM players)")
+    [[ $wrong -gt 0 ]] && echo "shard $k: 持ち主がこのシャードにいないアイテム ${wrong} 件"
+    mysql_shard "$i" -N -B "$DB_NAME" -e "SELECT trade_id, side FROM trade_log WHERE side <> 'same'" >"$tmp/log-$k"
+    local n_xa
+    n_xa=$(mysql_shard "$i" -N -B "$DB_NAME" -e "XA RECOVER" 2>/dev/null | wc -l)
+    xa=$((xa + n_xa))
+    [[ $n_xa -gt 0 ]] && echo "shard $k: 準備済みのまま残った XA トランザクション ${n_xa} 件（lab xa-recover で確認）"
+  done
+  local all unique dup missing
+  all=$(cat "$tmp"/items-* | wc -l)
+  unique=$(cat "$tmp"/items-* | sort -u | wc -l)
+  dup=$(cat "$tmp"/items-* | sort | uniq -d | wc -l)
+  missing=$((item_total - unique))
+  # トレードの片側の記録しか無いもの = 途中で止まったトレード
+  local half
+  half=$(cat "$tmp"/log-* | awk '{print $1}' | sort | uniq -u | wc -l)
+
+  echo "ゴールド合計   : ${gold}（初期 ${gold_total}、差 $((gold - gold_total))）"
+  echo "アイテム       : ${all} 件（初期 ${item_total}）、増殖 ${dup} 種類、消失 ${missing} 件"
+  echo "途中で止まったトレード: ${half} 件（trade_log に片側の記録しかない）"
+  echo "XA 準備済み    : ${xa} 件"
+  local ok=yes
+  [[ $gold -ne $gold_total || $dup -ne 0 || $missing -ne 0 || $half -ne 0 || $xa -ne 0 ]] && ok=no
+  echo "整合性         : ${ok}"
+  rm -rf "$tmp"
+  [[ $ok == yes ]]
+}
+
+# 準備済みのまま残った XA トランザクションを表示する。--commit / --rollback で片付ける
+cmd_xa_recover() {
+  local action=""
+  case ${1:-} in
+    --commit) action=COMMIT ;;
+    --rollback) action=ROLLBACK ;;
+    "") ;;
+    *) die "xa-recover: --commit か --rollback（指定なしは表示だけ）" ;;
+  esac
+  local i
+  for i in "${!SHARD_KEYS[@]}"; do
+    local k=${SHARD_KEYS[$i]} xid
+    echo "== shard $k"
+    mysql_shard "$i" -t "$DB_NAME" -e "XA RECOVER"
+    [[ -z $action ]] && continue
+    while read -r xid; do
+      [[ -n $xid ]] || continue
+      log "shard $k: XA $action '$xid'"
+      mysql_shard "$i" "$DB_NAME" -e "XA $action '$xid'"
+    done < <(mysql_shard "$i" -N -B "$DB_NAME" -e "XA RECOVER" | awk '{print $4}')
+  done
+}
+
 # ---------------------------------------------------------------- idle / sql
 cmd_idle() {
   local max=${IDLE_MAX_SECONDS:-3600}
@@ -344,8 +540,11 @@ main() {
     prepare) cmd_prepare "$@" ;;
     sweep) cmd_sweep "$@" ;;
     sums) wait_for_db; cmd_sums ;;
+    trade) cmd_trade "$@" ;;
+    check) wait_for_db; cmd_check ;;
+    xa-recover) wait_for_db; cmd_xa_recover "$@" ;;
     sql) cmd_sql "$@" ;;
-    *) die "不明なコマンド: $cmd（idle / prepare / sweep / sums / sql）" ;;
+    *) die "不明なコマンド: $cmd（idle / prepare / sweep / sums / trade / check / xa-recover / sql）" ;;
   esac
 }
 

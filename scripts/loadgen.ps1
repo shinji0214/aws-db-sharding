@@ -20,8 +20,11 @@
   # 負荷側の上限確認（SELECT 1）
   .\scripts\loadgen.ps1 'sweep --scenario select1 --select1 --threads "16 64 256" --time 60'
 
-  # シナリオ3: ホットスポット
-  .\scripts\loadgen.ps1 'sweep --scenario s3 --hot-id 1 --threads "1 2 4 8 16 32 64"'
+  # シナリオ3: ホットスポット（全員でワールドボス 1 を殴る）
+  .\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 2 4 8 16 32 64"'
+
+  # シナリオ4: アイテムトレード（売り手の COMMIT 直後に落ちる障害を入れる）
+  .\scripts\loadgen.ps1 'trade --mode naive --fault crash-between --fault-at 50' -Follow
 
   # 中に入って手で操作する（mysql クライアント: lab sql a）
   .\scripts\loadgen.ps1 -Exec
@@ -111,7 +114,7 @@ if ($Exec -or $Follow) {
 if ($Exec) {
   Write-Host ""
   Write-Host "入る: aws ecs execute-command --cluster $Cluster --task $taskId --container loadgen --interactive --command /bin/bash --region $Region"
-  Write-Host "中で: lab sql a / lab sums / lab sweep ...（待機は IDLE_MAX_SECONDS=3600 秒で自動終了）"
+  Write-Host "中で: lab sql a / lab sums / lab check / lab xa-recover ...（待機は IDLE_MAX_SECONDS=3600 秒で自動終了）"
 }
 elseif ($Follow) {
   # ログを流し続ける。最後に "done:" が出たら計測は終わり。Ctrl+C で表示だけ止まる（タスクは動き続ける）

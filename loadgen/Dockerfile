@@ -5,9 +5,10 @@ ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
 # sysbench: 負荷生成 / mysql-client: データ投入・確認 / sysstat: 負荷側 CPU の記録（mpstat）
+# php-cli + php-mysql: アイテムトレードのワーカー（シナリオ4・XA）
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      sysbench mysql-client sysstat gawk bsdextrautils jq curl unzip ca-certificates iproute2 procps less \
+      sysbench mysql-client sysstat php-cli php-mysql gawk bsdextrautils jq curl unzip ca-certificates iproute2 procps less \
  && rm -rf /var/lib/apt/lists/*
 
 # 結果を S3 に上げるための AWS CLI v2
@@ -18,6 +19,7 @@ RUN case "${TARGETARCH:-amd64}" in arm64) A=aarch64 ;; *) A=x86_64 ;; esac \
  && rm -rf /tmp/aws /tmp/awscli.zip
 
 COPY lua/ /opt/lab/lua/
+COPY php/ /opt/lab/php/
 COPY bin/ /opt/lab/bin/
 RUN chmod +x /opt/lab/bin/*
 ENV PATH="/opt/lab/bin:${PATH}"
