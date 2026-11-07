@@ -54,7 +54,7 @@ docker compose down -v
 ### 共通: 作業日の始め
 
 1. Actions → **構築・削除（Terraform）** → stack `db` / action `apply`、shards と instance_class を選ぶ → 承認
-   - パターン1・1b: `["a"]`、パターン2: `["a","b"]`
+   - パターン1: `["a"]`、パターン2: `["a","b"]`
    - 所要 15〜20 分程度（Aurora の作成待ち）
 2. 初回だけ: ジョブサマリーの outputs に出た `engine_version` を Variables に固定する（作業日をまたいで揃えるため）
 
@@ -75,7 +75,10 @@ docker compose down -v
    .\scripts\loadgen.ps1 'sweep --scenario select1 --select1 --threads "16 64 256" --time 60 --warmup 10' -Follow
    ```
 
-### Day 1: パターン1 → 1b（シナリオ1・1-B・3）
+### Day 1: パターン1（シナリオ1・3）
+
+題材はゲーム。プレイヤーは player_id でシャードに振り分ける（2シャードなら A = 奇数、B = 偶数）。
+シナリオ1・2はランダムなプレイヤーへの経験値加算、シナリオ3は全員でワールドボスの HP を削る。
 
 ```powershell
 # シナリオ1: 単一 Writer の限界（1, 2, 4 ... 256 スレッド。各段階 1分ウォームアップ + 3分計測 = 約36分）
@@ -87,28 +90,19 @@ docker compose down -v
 # H2 の確認（任意）: 10件まとめてコミット
 .\scripts\loadgen.ps1 'sweep --scenario s1-batch10 --batch 10 --threads "8 32 128"' -Follow
 
-# シナリオ3: ホットスポット（id = 1 に集中）
-.\scripts\loadgen.ps1 'sweep --scenario s3 --hot-id 1 --threads "1 2 4 8 16 32 64"' -Follow
+# シナリオ3: ホットスポット（全員でワールドボス 1 を殴る）
+.\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 2 4 8 16 32 64"' -Follow
 ```
 
-パターン1b（スケールアップ系列）は、Actions で同じ `db` を instance_class だけ変えて apply する。
-データはそのまま残るので prepare は不要。変更にかかった時間（停止時間）を記録する。
-
-1. `db.t4g.large` で apply → シナリオ1（label を `pattern1b-t4g.large` に）
-2. `db.r6g.large` → シナリオ1、シナリオ3
-3. `db.r6g.xlarge` → シナリオ1、シナリオ3
-
-> 1b 系列に r6g を含めるかは計画書の未決事項。決まるまでは t4g.large だけで進められる。
-
-シナリオ1-B（接続数の限界）の B〜D はアイドル接続を張る自作ツールが要るため、ツールの言語が決まってから追加する。
-A（性能軸）はシナリオ1の結果そのもの。
+任意: 「大きい1台で足りないか」を見るなら、Actions で同じ `db` を instance_class `db.t4g.large` に変えて apply し、
+シナリオ1をもう一度流す（label を `pattern1b-t4g.large` に）。データは残るので prepare は不要。変更にかかった時間も記録する。
 
 作業の終わりに **db を destroy**（下の「作業日の終わり」）。
 
-### Day 2: パターン2（シナリオ2・3・4）
+### Day 2: パターン2（シナリオ2・3・4・XA）
 
 1. Actions で `db` を shards `["a","b"]`、instance_class `db.t4g.medium` で apply
-2. prepare をやり直す（A に奇数 ID、B に偶数 ID）
+2. prepare をやり直す（A に奇数 ID、B に偶数 ID のプレイヤーとそのアイテム）
 3. 測定
 
 ```powershell
@@ -118,12 +112,49 @@ A（性能軸）はシナリオ1の結果そのもの。
 # 固定レート: パターン1の最大 TPS の 80% を全体のレートにして P99 を比べる（例: 最大 TPS が 3000 なら 2400）
 .\scripts\loadgen.ps1 'sweep --scenario s2-fixed --rate 2400 --threads "64"' -Follow
 
-# シナリオ3: ホットスポット（id = 1 は A が持つので、全スレッドが A に向かう）
-.\scripts\loadgen.ps1 'sweep --scenario s3 --hot-id 1 --threads "1 2 4 8 16 32 64"' -Follow
+# シナリオ3: ホットスポット（ワールドボス 1 は A にいるので、シャードを増やしても全スレッドが A に向かう）
+.\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 2 4 8 16 32 64"' -Follow
 ```
 
-シナリオ4（クロスシャード送金）はルーティングと障害注入のための自作ツールが要るので、ツールの言語が決まってから追加する。
-障害注入のうち AWS 側の操作は次のとおり用意してある。
+#### シナリオ4・XA: アイテムトレード（`lab trade`）
+
+トレード = 「売り手のアイテムを買い手に渡し、買い手は売り手にゴールドを払う」。PHP のワーカー（`loadgen/php/trade.php`）を
+`--workers` 本並べて流す。2人が同じシャードなら1トランザクション、別のシャードなら2つの DB を更新する。
+実行の前後に `lab check` が走り、ゴールド合計・アイテムの増殖と消失・途中で止まったトレード・XA の残りを照合する。
+
+```powershell
+# まず障害なしで流す（素朴版でも、落ちなければ整合性は保たれる）。性能は同一シャード / 別シャードの P95 を比べる
+.\scripts\loadgen.ps1 'trade --mode naive --workers 8 --time 120' -Follow
+
+# F1: 売り手側の COMMIT 直後にワーカー1を強制終了 → アイテム消失・ゴールドが増える
+.\scripts\loadgen.ps1 'trade --mode naive --fault crash-between --fault-at 50' -Follow
+# 順番を逆にすると（買い手側を先に COMMIT）→ アイテム増殖
+.\scripts\loadgen.ps1 'trade --mode naive --order buyer-first --fault crash-between --fault-at 50' -Follow
+
+# F2: 存在しない買い手とのトレード → 補償処理が無いと売り手側だけ確定して消失。--compensate で元に戻す
+.\scripts\loadgen.ps1 'trade --mode naive --fault missing-buyer --fault-at 50' -Follow
+.\scripts\loadgen.ps1 'trade --mode naive --fault missing-buyer --fault-at 50 --compensate' -Follow
+
+# XA（2相コミット）: 同じ障害を入れても整合性が保たれる。別シャードの P95 が素朴版よりどれだけ遅いかも見る
+.\scripts\loadgen.ps1 'trade --mode xa --fault missing-buyer --fault-at 50' -Follow
+# XA の弱点: PREPARE 直後に落ちる → 両シャードに準備済みトランザクションが残り、その行に触るトレードがロック待ちになる
+.\scripts\loadgen.ps1 'trade --mode xa --fault crash-after-prepare --fault-at 50' -Follow
+```
+
+summary.json の主な項目: `cross_ok`（別シャードで成功）、`half_done`（片側だけ確定、または結果が分からない）、
+`dup_key`（同じアイテムが既にあって INSERT できなかった = 増殖の後に出る）、`lock_timeout`（XA で固まった行に当たった）、
+`xa_in_doubt`（XA の COMMIT が途中で失敗し、準備済みが残った）。どちらの順番でも最初に売り手のアイテムをロックするので、
+障害を入れなければ素朴版でも整合性は保たれる。
+
+障害を入れた試行の後は、次の試行の前に `prepare` で世界を作り直す（崩れたままだと結果が混ざる）。
+XA の後始末は ECS Exec で入って行う（`lab xa-recover` で表示、`--commit` / `--rollback` で片付け）。
+片付けた後に `lab check` で整合性が戻ったことを確かめる。
+
+> Aurora のマスターユーザーで `XA RECOVER` が全セッション分見えるか（XA_RECOVER_ADMIN 権限）は要確認。
+> 見えない場合は `GRANT XA_RECOVER_ADMIN ON *.* TO admin` を試す。
+
+F3・F4 は `lab trade --time 300` を流している間に、手元から次の AWS 操作を行う。ネットワーク断や再起動の間に
+別シャードのトレードが失敗し、`half_done`（片側だけ確定、または結果が分からない）が増えるかを見る。
 
 #### F3: B へのネットワーク断（NACL）
 
@@ -154,7 +185,8 @@ Session Manager plugin を入れておく（[インストール手順](https://d
 .\scripts\loadgen.ps1 -Exec      # 待機タスクを起動し、入るためのコマンドを表示する
 # 表示された aws ecs execute-command ... を実行して中へ
 lab sql a                        # シャード a に mysql でつなぐ（パスワードは環境変数から自動）
-lab sums                         # 全シャードの件数・SUM(score)・SUM(balance)
+lab sums                         # 全シャードのプレイヤー数・経験値・ゴールド・アイテム数・ボス HP
+lab check                        # 整合性チェック（ゴールド合計・アイテムの増殖/消失・XA の残り）
 ```
 
 待機タスクは 1 時間で自動的に終わる（止め忘れ防止）。早く止めるときは表示された `aws ecs stop-task` を使う。
