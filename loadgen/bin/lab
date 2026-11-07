@@ -23,6 +23,12 @@ DB_USER=${DB_USER:-admin}
 DB_NAME=${DB_NAME:-lab}
 DB_PORT=${DB_PORT:-3306}
 
+# sweep の既定: 段階番号 → 同時スレッド数（全シャード合計）。--threads で上書きできる
+declare -A DEFAULT_THREADS_BY_STEP=(
+  [1]=1 [2]=2 [3]=4 [4]=8 [5]=16
+  [6]=32 [7]=64 [8]=128 [9]=256
+)
+
 log() { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
@@ -135,7 +141,7 @@ usage_sweep() {
   cat >&2 <<'EOF'
 lab sweep [options]
   --scenario NAME   結果の見出し（例: s1, s2, s3, select1）。既定 s1
-  --threads "1 2 4" 全シャード合計のスレッド数の段階。既定 "1 2 4 8 16 32 64 128 256"
+  --threads "1 2 4" 全シャード合計のスレッド数の段階（空白区切り）。省略時は DEFAULT_THREADS_BY_STEP
   --time SEC        各段階の計測秒数。既定 180
   --warmup SEC      各段階の前のウォームアップ秒数（結果に含めない）。既定 60
   --repeat N        各段階の繰り返し回数（飽和点付近の再測定用）。既定 1
@@ -177,7 +183,7 @@ ignored_errors() {
 }
 
 cmd_sweep() {
-  local scenario=s1 threads="1 2 4 8 16 32 64 128 256" time=180 warmup=60 repeat=1 rows=100000
+  local scenario=s1 threads="" time=180 warmup=60 repeat=1 rows=100000
   local hot_id=0 batch=1 rate=0 lua=lab_update.lua label=""
   while [[ $# -gt 0 ]]; do
     case $1 in
@@ -219,7 +225,7 @@ cmd_sweep() {
     echo "scenario=$scenario label=$label"
     echo "shards=${SHARDS:-a} active=$(for i in "${active[@]}"; do printf '%s ' "${SHARD_KEYS[$i]}"; done)"
     echo "instance_class=${DB_INSTANCE_CLASS:-unknown} engine_version=${DB_ENGINE_VERSION:-unknown}"
-    echo "threads=[$threads] time=$time warmup=$warmup repeat=$repeat rows=$rows hot_id=$hot_id batch=$batch rate=$rate lua=$lua"
+    echo "threads=[${threads:-default}] time=$time warmup=$warmup repeat=$repeat rows=$rows hot_id=$hot_id batch=$batch rate=$rate lua=$lua"
     echo "task_cpu=${TASK_CPU:-unknown} nproc=$(nproc)"
     echo "sysbench=$(sysbench --version)"
     if [[ -n "${ECS_CONTAINER_METADATA_URI_V4:-}" ]]; then
@@ -231,13 +237,20 @@ cmd_sweep() {
   cat "$dir/meta.txt" >&2
 
   # 段階番号 → その段階の同時スレッド数（全シャード合計）の対応表
-  #   --threads "1 2 4" なら THREADS_BY_STEP[1]=1, [2]=2, [3]=4
-  local -a THREADS_BY_STEP=()
-  local v
-  for v in $threads; do THREADS_BY_STEP+=("$v"); done
-  local nsteps=${#THREADS_BY_STEP[@]}
-  [[ $nsteps -gt 0 ]] || die "sweep: --threads が空"
-  THREADS_BY_STEP=("" "${THREADS_BY_STEP[@]}") # 1 始まりにする（[0] は使わない）
+  #   省略時は DEFAULT_THREADS_BY_STEP をそのまま使う
+  #   --threads "24 32 48" を指定したら THREADS_BY_STEP[1]=24, [2]=32, [3]=48 に置き換える
+  local -A THREADS_BY_STEP=()
+  local nsteps=0 v
+  if [[ -z $threads ]]; then
+    nsteps=${#DEFAULT_THREADS_BY_STEP[@]}
+    for ((v = 1; v <= nsteps; v++)); do THREADS_BY_STEP[$v]=${DEFAULT_THREADS_BY_STEP[$v]}; done
+  else
+    for v in $threads; do
+      nsteps=$((nsteps + 1))
+      THREADS_BY_STEP[$nsteps]=$v
+    done
+  fi
+  [[ $nsteps -gt 0 ]] || die "sweep: スレッド数の段階が空"
   log "steps: $(for ((s = 1; s <= nsteps; s++)); do printf '%d=%s ' "$s" "${THREADS_BY_STEP[$s]}"; done)"
 
   local step t r
