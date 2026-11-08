@@ -240,7 +240,7 @@ db.t4g.medium では Database Insights による Performance Schema の自動管
 
 ## 費用の目安（東京）
 
-単価は AWS Price List API（2026-10-29 公開分）で確認した値。
+単価は AWS Price List API（RDS は 2026-10-29、ECS は 2026-10-19 公開分）で確認した値。
 
 | 項目 | 単価の目安 | 備考 |
 |---|---|---|
