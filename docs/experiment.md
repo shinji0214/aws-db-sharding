@@ -150,8 +150,9 @@ summary.json の主な項目: `cross_ok`（別シャードで成功）、`half_d
 XA の後始末は ECS Exec で入って行う（`lab xa-recover` で表示、`--commit` / `--rollback` で片付け）。
 片付けた後に `lab check` で整合性が戻ったことを確かめる。
 
-> Aurora のマスターユーザーで `XA RECOVER` が全セッション分見えるか（XA_RECOVER_ADMIN 権限）は要確認。
-> 見えない場合は `GRANT XA_RECOVER_ADMIN ON *.* TO admin` を試す。
+> Aurora MySQL 3 のマスターユーザー（rds_superuser_role）には XA_RECOVER_ADMIN が含まれるので、
+> `XA RECOVER` で全セッション分が見える（[Master user account privileges](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/UsingWithRDS.MasterAccounts.html)）。
+> `lab check` が「XA RECOVER を実行できない」と出したら、権限を確認する。
 
 F3・F4 は `lab trade --time 300` を流している間に、手元から次の AWS 操作を行う。ネットワーク断や再起動の間に
 別シャードのトレードが失敗し、`half_done`（片側だけ確定、または結果が分からない）が増えるかを見る。
@@ -237,14 +238,21 @@ db.t4g.medium では Database Insights による Performance Schema の自動管
 
 6. 翌日、Cost Explorer で前日の課金が想定内か確認する
 
-## 費用の目安（東京、要確認）
+## 費用の目安（東京）
+
+単価は AWS Price List API（2026-10-29 公開分）で確認した値。
 
 | 項目 | 単価の目安 | 備考 |
 |---|---|---|
-| Aurora db.t4g.medium（I/O-Optimized） | 約 $0.1/h + 高負荷中の CPU 超過課金 | シャード数ぶん。作業日ごとに destroy |
-| Fargate タスク 2 vCPU / 4 GB（ARM64） | 約 $0.1/h | 動いている秒数だけ。シナリオ1の1回（約36分）で約 $0.06 |
+| Aurora db.t4g.medium（I/O-Optimized） | $0.147/h + 高負荷中の CPU 超過課金（$0.09/vCPU 時間。CPU 100% なら約 $0.14/h） | シャード数ぶん。作業日ごとに destroy |
+| Aurora db.t4g.large（I/O-Optimized、任意の1b） | $0.293/h + CPU 超過課金 | |
+| Fargate タスク 2 vCPU / 4 GB（ARM64） | 約 $0.099/h（$0.0405/vCPU 時間 + $0.0044/GB 時間） | 動いている秒数だけ。シナリオ1の1回（約36分）で約 $0.06 |
 | Container Insights | 1日あたり数円 | タスクが動いている間のメトリクス分 |
 | ECR / S3 / CloudWatch Logs | 月 $1 未満 | イメージ数百 MB、結果は数十 MB |
 | NAT Gateway・VPC エンドポイント | 0 | 作らない（タスクはパブリック IP で外へ出る。インバウンドは全て閉じている） |
+
+Aurora Standard だと I/O が 100万回あたり $0.24 かかり、数千 TPS を流すと1時間で数ドルになり得る。
+そのため db スタックの既定は I/O-Optimized（`storage_type = "aurora-iopt1"`）にしている。
+Standard → I/O-Optimized の切り替えは30日に1回までなので、作成時に指定したままにする。
 
 予算アラート（月 $30）は bootstrap で作る（[setup.md](setup.md) の 2）。
