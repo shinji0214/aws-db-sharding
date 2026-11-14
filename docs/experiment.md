@@ -102,10 +102,16 @@ docker compose down -v
 題材はゲーム。プレイヤーは player_id でシャードに振り分ける（2シャードなら A = 奇数、B = 偶数）。
 シナリオ1・2はランダムなプレイヤーへの経験値加算、シナリオ3は全員でワールドボスの HP を削る。
 
+測定1:
+
 ```powershell
 # シナリオ1: 単一 Writer の限界（1, 2, 4 ... 256 スレッド。各段階 1分ウォームアップ + 3分計測 = 約36分）
 .\scripts\loadgen.ps1 'sweep --scenario s1 --label pattern1-t4g.medium' -Follow
+```
 
+測定2（別の日。db を apply して prepare からやり直す）:
+
+```powershell
 # 飽和点付近を3回ずつ測り直す（例: 32〜128 が飽和点付近だった場合）
 .\scripts\loadgen.ps1 'sweep --scenario s1 --label pattern1-repeat --threads "32 64 128" --repeat 3' -Follow
 
@@ -129,7 +135,8 @@ docker compose down -v
 - s1-batch10 の summary.csv と、そのときの CommitLatency（M2-2）
 - シナリオ3の summary.csv と `lab sums` のボス HP（M2-3）、シナリオ3中の CPU と CommitLatency（M2-4）
 - Database Insights: シナリオ3の待機イベント（行ロック待ちが上位に来るか。M2-5）
-- シナリオ3の最中に ECS Exec で `SELECT * FROM performance_schema.data_lock_waits LIMIT 10`（M2-6）
+- シナリオ3の最中に ECS Exec で `SELECT * FROM performance_schema.data_lock_waits LIMIT 10`（M2-6）。
+  sweep は端末を占有するので、別のターミナルで事前に `loadgen.ps1 -Exec` で待機タスクを起動して入っておく
 - 1 ÷ CommitLatency とボスへの最大 TPS が近いかを計算して記録（M2-7）
 
 任意: 「大きい1台で足りないか」を見るなら、Actions で同じ `db` を instance_class `db.t4g.large` に変えて apply し、
@@ -208,7 +215,7 @@ F3・F4 は `lab trade --time 300` を流している間に、手元から次の
 - buyer-first + crash-between の `lab check`（増殖・ゴールド減。M4-3）
 - missing-buyer の `lab check`。補償なし（消失）と `--compensate`（yes）の2つ（M4-4）
 - xa + missing-buyer の summary.json と `lab check`（yes。M4-5）
-- xa + crash-after-prepare: `lab sql a` / `lab sql b` で `XA RECOVER`（同じ trade_id が1件ずつ。M4-6）、
+- xa + crash-after-prepare: `lab xa-recover --commit` の前に、`lab sql a` / `lab sql b` で `XA RECOVER`（同じ trade_id が1件ずつ。M4-6）、
   そのときの summary.json の `lock_timeout` と `lab check` の「XA 準備済み 2 件」（M4-7）
 - `lab xa-recover` → `--commit` → `lab check` で yes に戻るところ（M4-8）
 - 各 summary.json の `same_p95_ms` / `cross_p95_ms` を naive と xa で控える（M4-9）
@@ -226,7 +233,7 @@ aws ec2 create-network-acl-entry --network-acl-id $nacl --ingress --rule-number 
 aws ec2 delete-network-acl-entry --network-acl-id $nacl --ingress --rule-number 50
 ```
 
-- 📷 測定4: 拒否ルール（50番）を足した NACL の画面と、その間の summary.json の `half_done` / `xa_in_doubt`（M4-10）
+- 📷 測定4: 拒否ルール（50番）を足した NACL の画面（復旧の delete の前に撮る）と、その間の summary.json の `half_done` / `xa_in_doubt`（M4-10）
 
 Terraform は全許可のルール（100番）だけを管理しているので、手で足した 50 番は plan の差分にならない。
 **destroy の前に必ず消す**（残っていても destroy は通るが、次回の測定が全部失敗する）。
@@ -286,7 +293,7 @@ db.t4g.medium では Database Insights による Performance Schema の自動管
 3. F3 の NACL ルールを消したか確認
    - 📷 測定4: 確認した結果を記録（M4-12）
 4. Actions → stack `db` / action `destroy` → 承認
-   - 📷 測定1: destroy の承認とジョブ完了、下の残存確認コマンドの出力（M1-14。ARN は塗りつぶす）
+   - 📷 測定1: destroy の承認とジョブ完了（M1-14）
 5. 残存確認（タグの Project は `db-sharding-aws`）
 
    ```powershell
@@ -298,6 +305,8 @@ db.t4g.medium では Database Insights による Performance Schema の自動管
 
    最後のコマンドには base のもの（VPC・サブネット・SG・NACL・ECR・S3・ロググループ）が残るのが正常。
    タグ API は削除直後のリソースをしばらく返すことがあるので、個別の describe を正とする。
+
+   - 📷 測定1: 残存確認コマンドの出力（M1-14。ARN は塗りつぶす）
 
 6. 翌日、Cost Explorer で前日の課金が想定内か確認する
 
