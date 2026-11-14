@@ -83,6 +83,10 @@ terraform apply
 同じアカウントの他プロジェクトの費用を混ぜないため。タグで絞るには、Billing → **Cost allocation tags** で
 `Project` を有効化しておく（反映まで最大 24 時間。有効化より前の費用は集計されないので、構築の前日までに）。
 
+**予算の通知先メールは確認（verify）が必要。** 2026-09-30 以降に追加した宛先は、確認するまで予算アラートが届かない。
+apply 後に AWS から届く確認メールのリンクを開く。届いていなければ Budgets → 予算の詳細 → Email verification から再送する
+（状態が Pending のままだと通知されない）。
+
 apply ロールの権限は `variables.tf` の既定値（Aurora・VPC・ECS Fargate・ECR・監視向け）。
 db スタックを作っていて `AccessDenied ... <action>` が出たら、変数に足して手元PCで再 apply する。
 
@@ -100,7 +104,10 @@ gh variable set PROJECT --body "db-sharding-aws"
 
 Environment（Settings → Environments → New environment → `db-sharding-aws-apply`）
 
-- Required reviewers: 自分
+- Required reviewers: 自分。チェックを入れた後に出る入力欄でユーザーを追加してから保存する
+  （レビュアーが空のまま保存すると、チェックが外れた状態に戻る）
+- Prevent self-review: 外す（一人で運用するので、入れると自分で承認できなくなる）
+- Allow administrators to bypass configured protection rules: 外す（管理者でも承認を飛ばせないようにする）
 - Deployment branches and tags: Selected branches → `main` のみ
 
 ## 4. actions.lock を作る

@@ -36,6 +36,20 @@ AWS の準備（bootstrap・Secrets・Environment）は [setup.md](setup.md) を
 
 ## 作業日の流れ
 
+測定は4回（＋再配置の測定5）に分けて行う。各回で撮るもの・確かめることを、手順の中に「📷」で書いてある。
+番号（M1-6 など）は記事用のチェックリスト（プロジェクトファイルの `articles/capture-checklist.md`）と対応する。
+
+| 回 | 構成 | この手順書の節 |
+|---|---|---|
+| 測定1 | 1台 | 共通: 作業日の始め → Day 1 のシナリオ1 |
+| 測定2 | 1台 | 共通 → Day 1 の測り直し・まとめてコミット・シナリオ3（任意で t4g.large） |
+| 測定3 | 2台 | 共通 → Day 2 のシナリオ2・3 |
+| 測定4 | 2台 | 共通 → Day 2 のシナリオ4・XA・F3・F4 |
+
+📷 撮るときの注意（毎回）: アカウント ID（コンソール右上、ARN、バケット名、ECR の URI）、Aurora エンドポイントのランダム部分、
+メールアドレスは写さないか塗りつぶす。CloudWatch は UTC 表示にし、summary.csv の `start_utc` / `end_utc` に範囲をそろえる。
+ファイル名は `<回>-<番号>-<内容>.png`（例: `m1-08-cw-cpu-commitlatency.png`）。数値はスクショだけにせず、CSV・JSON・テキストでも残す。
+
 ### Day 0（AWS 費用なし）: 手元で負荷スクリプトを確認
 
 Docker Desktop があれば、MySQL 8.0 を2台立てて `lab` コマンドの動きを確かめられる（数値は性能の目安にならない）。
@@ -56,11 +70,15 @@ docker compose down -v
 1. Actions → **構築・削除（Terraform）** → stack `db` / action `apply`、shards と instance_class を選ぶ → 承認
    - パターン1: `["a"]`、パターン2: `["a","b"]`
    - 所要 15〜20 分程度（Aurora の作成待ち）
+   - 📷 測定1: apply ジョブの所要時間（M1-1）、承認待ちの画面（P2-3 を撮り直す場合）
+   - 📷 測定1・3: RDS コンソールのクラスタ一覧（M1-2 / M3-1。エンドポイントを塗りつぶす）
 2. 初回だけ: ジョブサマリーの outputs に出た `engine_version` を Variables に固定する（作業日をまたいで揃えるため）
 
    ```powershell
    gh variable set DB_ENGINE_VERSION --body "<engine_version の値>"
    ```
+
+   - 📷 測定1: `engine_version` を固定したか確認（M1-3）
 
 3. データを入れる（シャード構成を変えたら毎回やり直す）
 
@@ -69,11 +87,15 @@ docker compose down -v
    .\scripts\loadgen.ps1 'prepare --rows 100000' -Follow
    ```
 
+   - 📷 prepare の最後と `lab sums` の出力（測定1: M1-4、測定3: A に奇数・B に偶数で半分ずつ M3-2）
+
 4. 負荷側の上限を測っておく（DB ではなくタスクの限界を知るため）
 
    ```powershell
    .\scripts\loadgen.ps1 'sweep --scenario select1 --select1 --threads "16 64 256" --time 60 --warmup 10' -Follow
    ```
+
+   - 📷 測定1: select1 の summary.csv（負荷側の最大 QPS。M1-5）
 
 ### Day 1: パターン1（シナリオ1・3）
 
@@ -94,8 +116,26 @@ docker compose down -v
 .\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 2 4 8 16 32 64"' -Follow
 ```
 
+📷 測定1（シナリオ1の後、destroy の前に）
+- シナリオ1の summary.csv をそのまま保存（M1-6）。`valid = no` の段階がないか確認し、あれば記録（M1-12）
+- 飽和点の段階の `stepNN-...-a.txt`（sysbench の1秒ごとの出力）の一部（M1-7）
+- CloudWatch: CPUUtilization と CommitLatency を同じグラフで（M1-8）、CPUCreditBalance / CPUSurplusCreditBalance /
+  CPUSurplusCreditsCharged（M1-9）、DMLThroughput / CommitThroughput / DatabaseConnections（M1-10）。すべて get-metric-data の JSON も残す
+- Database Insights: 飽和点の前後の待機イベント上位（M1-11）
+- `lab sql a` で `SHOW VARIABLES LIKE 'max_connections'` の実値（M1-13）
+
+📷 測定2
+- 飽和点付近を3回ずつ測った summary.csv（ばらつきが 10% 以内か。M2-1）
+- s1-batch10 の summary.csv と、そのときの CommitLatency（M2-2）
+- シナリオ3の summary.csv と `lab sums` のボス HP（M2-3）、シナリオ3中の CPU と CommitLatency（M2-4）
+- Database Insights: シナリオ3の待機イベント（行ロック待ちが上位に来るか。M2-5）
+- シナリオ3の最中に ECS Exec で `SELECT * FROM performance_schema.data_lock_waits LIMIT 10`（M2-6）
+- 1 ÷ CommitLatency とボスへの最大 TPS が近いかを計算して記録（M2-7）
+
 任意: 「大きい1台で足りないか」を見るなら、Actions で同じ `db` を instance_class `db.t4g.large` に変えて apply し、
 シナリオ1をもう一度流す（label を `pattern1b-t4g.large` に）。データは残るので prepare は不要。変更にかかった時間も記録する。
+
+- 📷 測定2（任意 1b）: instance_class の変更にかかった時間と、t4g.large でのシナリオ1の summary.csv（M2-8）
 
 作業の終わりに **db を destroy**（下の「作業日の終わり」）。
 
@@ -115,6 +155,12 @@ docker compose down -v
 # シナリオ3: ホットスポット（ワールドボス 1 は A にいるので、シャードを増やしても全スレッドが A に向かう）
 .\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 2 4 8 16 32 64"' -Follow
 ```
+
+📷 測定3
+- シナリオ2の summary.csv（M3-3）と、固定レートの summary.csv（P95 / P99 を1台と比べる。M3-4）
+- CloudWatch: A と B の CPUUtilization を同じグラフで（偏りがないか。M3-5）
+- シナリオ3（2台）の summary.csv と、A と B の CPU（B が暇なまま。M3-6）
+- Database Insights: シナリオ2の A と B の待機イベント（M3-7）
 
 #### シナリオ4・XA: アイテムトレード（`lab trade`）
 
@@ -156,6 +202,18 @@ XA の後始末は ECS Exec で入って行う（`lab xa-recover` で表示、`-
 F3・F4 は `lab trade --time 300` を流している間に、手元から次の AWS 操作を行う。ネットワーク断や再起動の間に
 別シャードのトレードが失敗し、`half_done`（片側だけ確定、または結果が分からない）が増えるかを見る。
 
+📷 測定4（トレード・XA）
+- 障害なし（naive）の summary.json と `lab check`（整合性 yes。M4-1）
+- seller-first + crash-between の `lab check`（消失・ゴールド増）と、ワーカーの「障害注入: … 強制終了」のログ（M4-2）
+- buyer-first + crash-between の `lab check`（増殖・ゴールド減。M4-3）
+- missing-buyer の `lab check`。補償なし（消失）と `--compensate`（yes）の2つ（M4-4）
+- xa + missing-buyer の summary.json と `lab check`（yes。M4-5）
+- xa + crash-after-prepare: `lab sql a` / `lab sql b` で `XA RECOVER`（同じ trade_id が1件ずつ。M4-6）、
+  そのときの summary.json の `lock_timeout` と `lab check` の「XA 準備済み 2 件」（M4-7）
+- `lab xa-recover` → `--commit` → `lab check` で yes に戻るところ（M4-8）
+- 各 summary.json の `same_p95_ms` / `cross_p95_ms` を naive と xa で控える（M4-9）
+- Database Insights: XA の試行中の待機イベント（M4-13）
+
 #### F3: B へのネットワーク断（NACL）
 
 NACL はステートレスなので、確立済みの接続も即座に止まる（SG のルール削除は既存の接続を切らないことがある）。
@@ -168,6 +226,8 @@ aws ec2 create-network-acl-entry --network-acl-id $nacl --ingress --rule-number 
 aws ec2 delete-network-acl-entry --network-acl-id $nacl --ingress --rule-number 50
 ```
 
+- 📷 測定4: 拒否ルール（50番）を足した NACL の画面と、その間の summary.json の `half_done` / `xa_in_doubt`（M4-10）
+
 Terraform は全許可のルール（100番）だけを管理しているので、手で足した 50 番は plan の差分にならない。
 **destroy の前に必ず消す**（残っていても destroy は通るが、次回の測定が全部失敗する）。
 
@@ -176,6 +236,8 @@ Terraform は全許可のルール（100番）だけを管理しているので�
 ```powershell
 aws rds reboot-db-instance --db-instance-identifier db-sharding-aws-b-1
 ```
+
+- 📷 測定4: RDS のイベント画面（B の再起動）と、その間の summary.json（M4-11）
 
 ### 中に入って手で操作する（ECS Exec）
 
@@ -222,7 +284,9 @@ db.t4g.medium では Database Insights による Performance Schema の自動管
 1. 結果を手元へ: `.\scripts\loadgen.ps1 -Sync`
 2. Database Insights / CloudWatch のメトリクスを取り出す（上の節）
 3. F3 の NACL ルールを消したか確認
+   - 📷 測定4: 確認した結果を記録（M4-12）
 4. Actions → stack `db` / action `destroy` → 承認
+   - 📷 測定1: destroy の承認とジョブ完了、下の残存確認コマンドの出力（M1-14。ARN は塗りつぶす）
 5. 残存確認（タグの Project は `db-sharding-aws`）
 
    ```powershell
@@ -236,6 +300,8 @@ db.t4g.medium では Database Insights による Performance Schema の自動管
    タグ API は削除直後のリソースをしばらく返すことがあるので、個別の describe を正とする。
 
 6. 翌日、Cost Explorer で前日の課金が想定内か確認する
+
+   - 📷 全部終わった後: Cost Explorer で `Project = db-sharding-aws` の日別費用（C-1）とサービス別の内訳（C-2）
 
 ## 費用の目安（東京、要確認）
 
