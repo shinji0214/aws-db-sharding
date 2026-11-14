@@ -75,6 +75,9 @@ resource "aws_rds_cluster_instance" "writer" {
 
   monitoring_interval = var.monitoring_interval
   monitoring_role_arn = var.monitoring_interval > 0 ? aws_iam_role.rds_monitoring.arn : null
+
+  # ロールに監視用ポリシーが付く前にインスタンスを作ると ENHANCED_MONITORING の権限不足で失敗することがある
+  depends_on = [aws_iam_role_policy_attachment.rds_monitoring]
 }
 
 # Enhanced Monitoring 用ロール
