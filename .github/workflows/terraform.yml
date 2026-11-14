@@ -47,6 +47,8 @@ env:
   TF_VAR_instance_class: ${{ inputs.instance_class }}
   # 作業日をまたいでエンジンバージョンを揃える。Day 1 の outputs の engine_version を Variables に登録する
   TF_VAR_engine_version: ${{ vars.DB_ENGINE_VERSION || '' }}
+  # Aurora エンドポイント（writer・reader・インスタンス）のランダム部分を伏せる sed 式。ログとサマリーは public
+  ENDPOINT_MASK: 's/\.(cluster-(ro-|custom-)?)?[a-z0-9]+\.([a-z0-9-]+)\.rds\.amazonaws\.com/.\1************.\3.rds.amazonaws.com/g'
 
 jobs:
   plan:
@@ -90,7 +92,8 @@ jobs:
           terraform plan -no-color -lock=false ${{ inputs.action == 'destroy' && '-destroy' || '' }} > plan_raw.txt
           # ジョブサマリーにはマスクが効かないことがあるのでアカウントIDを自分で伏せる
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          sed "s/${ACCOUNT_ID}/************/g" plan_raw.txt > plan.txt
+          # Aurora エンドポイントのランダム部分も伏せる（destroy の plan には全属性が出る）
+          sed -E "s/${ACCOUNT_ID}/************/g; ${ENDPOINT_MASK}" plan_raw.txt > plan.txt
           rm -f plan_raw.txt
           cat plan.txt
           {
@@ -140,21 +143,26 @@ jobs:
             -backend-config="use_lockfile=true"
 
       # plan ファイルは Artifact で渡さない（public リポジトリでは誰でも取得できる）
+      # ログは public なので、アカウントIDと Aurora エンドポイントのランダム部分を伏せて出す
       - name: terraform ${{ inputs.action }}
         run: |
+          set -o pipefail
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          MASK="s/${ACCOUNT_ID}/************/g; ${ENDPOINT_MASK}"
           if [ "${{ inputs.action }}" = "destroy" ]; then
-            terraform destroy -auto-approve -no-color
+            terraform destroy -auto-approve -no-color 2>&1 | sed -u -E "$MASK"
           else
-            terraform apply -auto-approve -no-color
+            terraform apply -auto-approve -no-color 2>&1 | sed -u -E "$MASK"
           fi
 
       - name: outputs
         if: inputs.action == 'apply'
         run: |
+          set -o pipefail
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           {
             echo "## outputs: ${{ inputs.stack }}"
             echo '```'
-            terraform output -no-color | sed "s/${ACCOUNT_ID}/************/g"
+            terraform output -no-color | sed -E "s/${ACCOUNT_ID}/************/g; ${ENDPOINT_MASK}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

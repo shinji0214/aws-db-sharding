@@ -87,6 +87,8 @@ docker compose down -v
    .\scripts\loadgen.ps1 'prepare --rows 100000' -Follow
    ```
 
+   `-Follow` はタスクのログを流し、タスクが止まると「タスクが終了しました」と出して自動で抜ける。
+
    - 📷 prepare の最後と `lab sums` の出力（測定1: M1-4、測定3: A に奇数・B に偶数で半分ずつ M3-2）
 
 4. 負荷側の上限を測っておく（DB ではなくタスクの限界を知るため）
@@ -105,18 +107,20 @@ docker compose down -v
 測定1:
 
 ```powershell
-# シナリオ1: 単一 Writer の限界（1, 2, 4 ... 256 スレッド。各段階 1分ウォームアップ + 3分計測 = 約36分）
-.\scripts\loadgen.ps1 'sweep --scenario s1 --label pattern1-t4g.medium' -Follow
+# シナリオ1: 単一 Writer の限界（9段階。各段階 1分ウォームアップ + 3分計測 = 約36分）
+# t4g.medium は max_connections が 90 前後なので、段階は 80 までにする。
+# 上限を超える段階は lab が自動でスキップし（summary.csv の valid=skip(...)）、実際の値は meta.txt の max_connections に残る
+.\scripts\loadgen.ps1 'sweep --scenario s1 --label pattern1-t4g.medium --threads "1 2 4 8 16 32 48 64 80"' -Follow
 ```
 
 測定2（別の日。db を apply して prepare からやり直す）:
 
 ```powershell
-# 飽和点付近を3回ずつ測り直す（例: 32〜128 が飽和点付近だった場合）
-.\scripts\loadgen.ps1 'sweep --scenario s1 --label pattern1-repeat --threads "32 64 128" --repeat 3' -Follow
+# 飽和点付近を3回ずつ測り直す（例: 32〜80 が飽和点付近だった場合。t4g.medium は 80 まで）
+.\scripts\loadgen.ps1 'sweep --scenario s1 --label pattern1-repeat --threads "32 64 80" --repeat 3' -Follow
 
 # H2 の確認（任意）: 10件まとめてコミット
-.\scripts\loadgen.ps1 'sweep --scenario s1-batch10 --batch 10 --threads "8 32 128"' -Follow
+.\scripts\loadgen.ps1 'sweep --scenario s1-batch10 --batch 10 --threads "8 32 80"' -Follow
 
 # シナリオ3: ホットスポット（全員でワールドボス 1 を殴る）
 .\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 2 4 8 16 32 64"' -Follow
@@ -299,7 +303,7 @@ db.t4g.medium では Database Insights による Performance Schema の自動管
    ```powershell
    aws rds describe-db-clusters --query "DBClusters[].DBClusterIdentifier"
    aws rds describe-db-cluster-snapshots --snapshot-type manual --query "DBClusterSnapshots[].DBClusterSnapshotIdentifier"
-   aws ecs list-tasks --cluster db-sharding-aws-loadgen   # クラスタごと消えていればエラーになる（それで正常）
+   aws ecs list-tasks --cluster db-sharding-aws-loadgen   # 削除済みクラスタは INACTIVE で残るので、"taskArns": [] なら正常
    aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=db-sharding-aws --query "ResourceTagMappingList[].ResourceARN"
    ```
 
