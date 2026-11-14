@@ -80,7 +80,7 @@ terraform apply
 ```
 
 予算アラート（月 $30、50% / 100% / 予測 100% でメール）はタグ `Project=db-sharding-aws` の費用だけを数える。
-同じアカウントのハニーポットの費用を混ぜないため。タグで絞るには、Billing → **Cost allocation tags** で
+同じアカウントの他プロジェクトの費用を混ぜないため。タグで絞るには、Billing → **Cost allocation tags** で
 `Project` を有効化しておく（反映まで最大 24 時間。有効化より前の費用は集計されないので、構築の前日までに）。
 
 apply ロールの権限は `variables.tf` の既定値（Aurora・VPC・ECS Fargate・ECR・監視向け）。
