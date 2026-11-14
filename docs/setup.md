@@ -33,7 +33,7 @@ AWS の認証はアクセスキーを使わず OIDC。コマンドは Windows Po
 ## 0. 決めたこと
 
 - `<PROJECT>` = `db-sharding-aws`、リージョン = `ap-northeast-1`
-- AWS アカウント: ハニーポット検証と同じ管理アカウント（Identity Center のプロファイルを流用）
+- AWS アカウント: ハニーポット検証で使った管理アカウント（Identity Center のプロファイルを流用。ハニーポットは撤収済み）
 - このリポジトリは 2026-07-15 以降に作成したので、OIDC の `sub` は ID 付き形式
   `repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:...`。ID は次で確認できる（秘密情報ではない）
 
@@ -41,41 +41,33 @@ AWS の認証はアクセスキーを使わず OIDC。コマンドは Windows Po
 gh api repos/<OWNER>/<REPO> --jq '{id, owner_id: .owner.id, created_at}'
 ```
 
-## 1. OIDC プロバイダを専用スタックへ移す（github-oidc）
+## 1. OIDC プロバイダを作る（github-oidc）
 
 📝 学習メモ: OIDC プロバイダ（`token.actions.githubusercontent.com`）はアカウントに1つしか作れない。
-今はハニーポット検証の bootstrap の state が持っているので、そちらを destroy すると、プロバイダを参照している
-このリポジトリの Actions も `No OpenIDConnect provider found` で止まる。
-どのプロジェクトにも属さないスタックに持ち主を移せば、各プロジェクトの bootstrap を自由に作って消せる。
-AWS 上のプロバイダは作り直さず、state の持ち主だけを付け替えるので、ハニーポットの Actions も止まらない。
+どこかのプロジェクトの bootstrap に持たせると、その bootstrap を destroy したときに、プロバイダを参照している
+他のプロジェクトの Actions も `No OpenIDConnect provider found` で止まる。
+どのプロジェクトにも属さないこのスタックに持たせれば、各プロジェクトの bootstrap を自由に作って消せる。
+
+まず、アカウントにプロバイダが既にあるかを確かめる（ハニーポット検証の bootstrap は撤収済みで、そのとき一緒に消えている見込み）。
 
 ```powershell
 $env:AWS_PROFILE = "<PROFILE>"
 aws sso login --profile <PROFILE>        # 切れていれば
 aws sts get-caller-identity              # AWSReservedSSO_AdministratorAccess_... なら OK
+aws iam list-open-id-connect-providers   # 空（[]）なら新規作成、token.actions.githubusercontent.com があれば取り込み
+```
 
+```powershell
 cd terraform/github-oidc
 terraform init
-terraform plan    # 「1 to import」と、タグの変更（Project=shared など）だけが出ることを確認
+# プロバイダが既にある場合だけ: 作り直さずに取り込む（<ACCOUNT_ID> は get-caller-identity の Account）
+# terraform import aws_iam_openid_connect_provider.github arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com
+terraform plan    # 新規なら「1 to add」、取り込んだならタグの変更（Project=shared など）だけ
 terraform apply
 ```
 
 - `prevent_destroy = true` にしてあるので、誤って destroy しようとしても止まる
-- プロバイダがまだ無い新しいアカウントで使うときは、`main.tf` の `import` ブロックを消してから apply する
-
-### 1-2. ハニーポット側から手放す（ハニーポットのリポジトリで実施）
-
-1 の apply が終わってから行う。順番が逆でも AWS 上のプロバイダは消えないが、持ち主がいない時間を作らないため。
-
-```powershell
-cd <ハニーポットのリポジトリ>/terraform/bootstrap
-# terraform.tfvars に create_github_oidc_provider = false を設定（既存を参照する側に切り替える）
-terraform state rm 'aws_iam_openid_connect_provider.github[0]'
-terraform plan    # No changes になることを確認（ロールの信頼ポリシーが参照する ARN は同じ）
-```
-
-- `state rm` は Terraform の管理から外すだけで、AWS 上のプロバイダは消さない
-- tfvars を false にせず `state rm` だけすると、次の apply でプロバイダを作り直そうとして `EntityAlreadyExists` になる
+- 既にあるのに import せず apply すると `EntityAlreadyExists` で止まる。その場合は上の import をしてからやり直す
 
 ## 2. bootstrap を apply（このリポジトリ）
 
@@ -88,7 +80,7 @@ terraform apply
 ```
 
 予算アラート（月 $30、50% / 100% / 予測 100% でメール）はタグ `Project=db-sharding-aws` の費用だけを数える。
-同じアカウントのハニーポットの費用を混ぜないため。タグで絞るには、Billing → **Cost allocation tags** で
+同じアカウントの他プロジェクトの費用を混ぜないため。タグで絞るには、Billing → **Cost allocation tags** で
 `Project` を有効化しておく（反映まで最大 24 時間。有効化より前の費用は集計されないので、構築の前日までに）。
 
 apply ロールの権限は `variables.tf` の既定値（Aurora・VPC・ECS Fargate・ECR・監視向け）。

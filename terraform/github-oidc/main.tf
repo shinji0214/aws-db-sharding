@@ -1,12 +1,12 @@
 # github-oidc: GitHub Actions の OIDC プロバイダだけを持つ、アカウント共通のスタック。
 #
 # なぜ分けるか:
-#   OIDC プロバイダはアカウントに1つしか作れない。今はハニーポット検証の bootstrap が持っているため、
-#   そちらを destroy するとこのリポジトリの Actions も止まる。プロバイダをどのプロジェクトにも属さない
-#   このスタックへ移しておけば、各プロジェクトの bootstrap は自由に作って消せる。
+#   OIDC プロバイダはアカウントに1つしか作れない。どこかのプロジェクトの bootstrap に持たせると、
+#   その bootstrap を destroy したときに、プロバイダを使う他のプロジェクトの Actions も止まる。
+#   どのプロジェクトにも属さないこのスタックに持たせれば、各プロジェクトの bootstrap は自由に作って消せる。
 #
 # 手元PCから管理者（Identity Center のプロファイル）で apply する。state は手元（.gitignore 済み）。
-# 既存のプロバイダは下の import ブロックで取り込む（作り直さないので Actions は止まらない）。
+# プロバイダが既にあるアカウントでは、apply の前に terraform import で取り込む（docs/setup.md の 1）。
 terraform {
   required_version = ">= 1.10.0"
   required_providers {
@@ -33,16 +33,8 @@ variable "region" {
   default = "ap-northeast-1"
 }
 
-data "aws_caller_identity" "current" {}
-
 locals {
   oidc_host = "token.actions.githubusercontent.com"
-}
-
-# 既存プロバイダの取り込み。プロバイダが無い新しいアカウントで使うときは、このブロックを消して apply する
-import {
-  to = aws_iam_openid_connect_provider.github
-  id = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${local.oidc_host}"
 }
 
 resource "aws_iam_openid_connect_provider" "github" {

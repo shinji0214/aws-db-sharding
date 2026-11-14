@@ -1,7 +1,7 @@
 # 予算アラート（ガードレール）。db / base を destroy しても消えないよう、手元PCで持つ bootstrap に置く。
 # budget_email が空なら作らない。
 #
-# 📝 学習メモ: 予算はタグ Project=<project> の費用だけを見る（同じアカウントのハニーポットの費用を混ぜないため）。
+# 📝 学習メモ: 予算はタグ Project=<project> の費用だけを見る（同じアカウントの他プロジェクトの費用を混ぜないため）。
 # タグで絞るには、Billing → Cost allocation tags で `Project` を有効化しておく必要がある（反映まで最大24時間）。
 # 有効化前の費用は集計されないので、構築前日までに済ませる。
 resource "aws_budgets_budget" "project" {
