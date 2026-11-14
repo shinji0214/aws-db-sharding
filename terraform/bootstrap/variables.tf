@@ -62,7 +62,9 @@ variable "attachable_policy_arns" {
 variable "pass_role_services" {
   description = "<project>-* ロールを渡してよいサービス"
   type        = list(string)
-  default     = ["ecs-tasks.amazonaws.com", "monitoring.rds.amazonaws.com", "ec2.amazonaws.com"]
+  # 拡張モニタリングのロールは CreateDBInstance の中で RDS に渡すため、PassedToService は rds.amazonaws.com になる
+  # （monitoring.rds.amazonaws.com は信頼ポリシー側の Principal。両方入れておく）
+  default = ["ecs-tasks.amazonaws.com", "rds.amazonaws.com", "monitoring.rds.amazonaws.com", "ec2.amazonaws.com"]
 }
 
 variable "service_linked_role_services" {
