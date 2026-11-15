@@ -171,14 +171,22 @@ s1-batch10 の tps は「トランザクション/秒」なので、更新した
 3. 測定
 
 ```powershell
-# シナリオ2: 総スレッド数を同じ段階で増やし、A と B に半分ずつ割り当てる（総 TPS = 2シャードの合計）
-.\scripts\loadgen.ps1 'sweep --scenario s2 --label pattern2' -Follow
+# シナリオ2: 総スレッド数を同じ段階で増やし、A と B に半分ずつ割り当てる（総 TPS = 2シャードの合計。約40分）
+# 1台のときは 80 本（max_connections=90）が上限だった。2台なら1台あたり 80 本まで張れるので、総数 160 本まで伸ばす
+.\scripts\loadgen.ps1 'sweep --scenario s2 --label pattern2 --threads "1 2 4 8 16 32 64 96 128 160"' -Follow
 
-# 固定レート: パターン1の最大 TPS の 80% を全体のレートにして P99 を比べる（例: 最大 TPS が 3000 なら 2400）
-.\scripts\loadgen.ps1 'sweep --scenario s2-fixed --rate 2400 --threads "64"' -Follow
+# 固定レート: 1台の最大 TPS（測定1・2で約 5,300）の 80% = 4,250 を全体のレートにして P95 / P99 を比べる（約4分）
+# 1台では同じレートを固定で測っていないので、目安として測定2の1台 64 本（上限まで、約 4,750 TPS、p99 約 33ms）と並べる。
+# 2台なら同じくらいのレートを半分ずつ受けるので待ち時間が短くなるはず（同条件の比較が要るなら、1台構成で --rate 4250 も流す）
+.\scripts\loadgen.ps1 'sweep --scenario s2-fixed --rate 4250 --threads "80"' -Follow
 
-# シナリオ3: ホットスポット（ワールドボス 1 は A にいるので、シャードを増やしても全スレッドが A に向かう）
+# シナリオ3: ホットスポット（ワールドボス 1 は A にいるので、シャードを増やしても全スレッドが A に向かう。約28分）
 .\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 2 4 8 16 32 64"' -Follow
+
+# 各 sweep の後、destroy の前に。シャードごとに1回ずつ（シナリオ3 の b は暇なままのはず）
+.\scripts\loadgen.ps1 -Sync
+.\scripts\step-metrics.ps1 <run_id>
+.\scripts\step-metrics.ps1 <run_id> -Shard b
 ```
 
 📷 測定3
@@ -186,6 +194,34 @@ s1-batch10 の tps は「トランザクション/秒」なので、更新した
 - CloudWatch: A と B の CPUUtilization を同じグラフで（偏りがないか。M3-5）
 - シナリオ3（2台）の summary.csv と、A と B の CPU（B が暇なまま。M3-6）
 - Database Insights: シナリオ2の A と B の待機イベント（M3-7）
+
+#### 測定4の最初に: 2台で10件まとめてコミット（約16分）
+
+測定2の s1-batch10 は 1台 80 本で DB CPU 94.6%（約 9,700 行/秒）と、接続数ではなく CPU で頭打ちになった。
+2台ならこの CPU の天井も2倍（約 19,400 行/秒）になるかを確かめる。合計本数なので、各シャード 1・8・32・80 本で測定2と同じ本数になる。
+
+```powershell
+.\scripts\loadgen.ps1 'sweep --scenario s2-batch10 --batch 10 --threads "2 16 64 160"' -Follow
+.\scripts\loadgen.ps1 -Sync
+.\scripts\step-metrics.ps1 <run_id>
+.\scripts\step-metrics.ps1 <run_id> -Shard b
+```
+
+📷 測定4: s2-batch10 の summary.csv と、A・B の step-metrics（行/秒 = tps × 10 を測定2の 1台と比べる）
+
+#### 測定4: 2台でのシナリオ3（ボス。約20分）
+
+測定3では結果が自明として見送ったが、記事の実測の根拠として測る。ボス（boss_id 1）は A にしかいないので、lab は A にだけ負荷をかける（B は暇なまま）。
+本数は測定2の1台と同じ段階のうち 1・4・16・32・64。
+
+```powershell
+.\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 4 16 32 64"' -Follow
+.\scripts\loadgen.ps1 -Sync
+.\scripts\step-metrics.ps1 <run_id>
+.\scripts\step-metrics.ps1 <run_id> -Shard b
+```
+
+📷 測定4（M3-6 をここで取る）: summary.csv、CloudWatch で A と B の CPUUtilization を同じグラフに（A だけ上がり B は平ら）、step-metrics の CSV（CommitLatency と row_lock_wait）
 
 #### シナリオ4・XA: アイテムトレード（`lab trade`）
 
