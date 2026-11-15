@@ -209,6 +209,20 @@ s1-batch10 の tps は「トランザクション/秒」なので、更新した
 
 📷 測定4: s2-batch10 の summary.csv と、A・B の step-metrics（行/秒 = tps × 10 を測定2の 1台と比べる）
 
+#### 測定4: 2台でのシナリオ3（ボス。約20分）
+
+測定3では結果が自明として見送ったが、記事の実測の根拠として測る。ボス（boss_id 1）は A にしかいないので、lab は A にだけ負荷をかける（B は暇なまま）。
+本数は測定2の1台と同じ段階のうち 1・4・16・32・64。
+
+```powershell
+.\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 4 16 32 64"' -Follow
+.\scripts\loadgen.ps1 -Sync
+.\scripts\step-metrics.ps1 <run_id>
+.\scripts\step-metrics.ps1 <run_id> -Shard b
+```
+
+📷 測定4（M3-6 をここで取る）: summary.csv、CloudWatch で A と B の CPUUtilization を同じグラフに（A だけ上がり B は平ら）、step-metrics の CSV（CommitLatency と row_lock_wait）
+
 #### シナリオ4・XA: アイテムトレード（`lab trade`）
 
 トレード = 「売り手のアイテムを買い手に渡し、買い手は売り手にゴールドを払う」。PHP のワーカー（`loadgen/php/trade.php`）を
