@@ -195,6 +195,20 @@ s1-batch10 の tps は「トランザクション/秒」なので、更新した
 - シナリオ3（2台）の summary.csv と、A と B の CPU（B が暇なまま。M3-6）
 - Database Insights: シナリオ2の A と B の待機イベント（M3-7）
 
+#### 測定4の最初に: 2台で10件まとめてコミット（約16分）
+
+測定2の s1-batch10 は 1台 80 本で DB CPU 94.6%（約 9,700 行/秒）と、接続数ではなく CPU で頭打ちになった。
+2台ならこの CPU の天井も2倍（約 19,400 行/秒）になるかを確かめる。合計本数なので、各シャード 1・8・32・80 本で測定2と同じ本数になる。
+
+```powershell
+.\scripts\loadgen.ps1 'sweep --scenario s2-batch10 --batch 10 --threads "2 16 64 160"' -Follow
+.\scripts\loadgen.ps1 -Sync
+.\scripts\step-metrics.ps1 <run_id>
+.\scripts\step-metrics.ps1 <run_id> -Shard b
+```
+
+📷 測定4: s2-batch10 の summary.csv と、A・B の step-metrics（行/秒 = tps × 10 を測定2の 1台と比べる）
+
 #### シナリオ4・XA: アイテムトレード（`lab trade`）
 
 トレード = 「売り手のアイテムを買い手に渡し、買い手は売り手にゴールドを払う」。PHP のワーカー（`loadgen/php/trade.php`）を
