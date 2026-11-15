@@ -171,14 +171,21 @@ s1-batch10 の tps は「トランザクション/秒」なので、更新した
 3. 測定
 
 ```powershell
-# シナリオ2: 総スレッド数を同じ段階で増やし、A と B に半分ずつ割り当てる（総 TPS = 2シャードの合計）
-.\scripts\loadgen.ps1 'sweep --scenario s2 --label pattern2' -Follow
+# シナリオ2: 総スレッド数を同じ段階で増やし、A と B に半分ずつ割り当てる（総 TPS = 2シャードの合計。約40分）
+# 1台のときは 80 本（max_connections=90）が上限だった。2台なら1台あたり 80 本まで張れるので、総数 160 本まで伸ばす
+.\scripts\loadgen.ps1 'sweep --scenario s2 --label pattern2 --threads "1 2 4 8 16 32 64 96 128 160"' -Follow
 
-# 固定レート: パターン1の最大 TPS の 80% を全体のレートにして P99 を比べる（例: 最大 TPS が 3000 なら 2400）
-.\scripts\loadgen.ps1 'sweep --scenario s2-fixed --rate 2400 --threads "64"' -Follow
+# 固定レート: 1台の最大 TPS（測定1・2で約 5,300）の 80% = 4,250 を全体のレートにして P95 / P99 を比べる（約4分）
+# 比較相手は測定2の1台 64 本（約 4,750 TPS、p99 約 33ms）。2台なら同じレートを半分ずつ受けるので待ち時間が短くなるはず
+.\scripts\loadgen.ps1 'sweep --scenario s2-fixed --rate 4250 --threads "80"' -Follow
 
-# シナリオ3: ホットスポット（ワールドボス 1 は A にいるので、シャードを増やしても全スレッドが A に向かう）
+# シナリオ3: ホットスポット（ワールドボス 1 は A にいるので、シャードを増やしても全スレッドが A に向かう。約28分）
 .\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 2 4 8 16 32 64"' -Follow
+
+# 各 sweep の後、destroy の前に。シャードごとに1回ずつ（シナリオ3 の b は暇なままのはず）
+.\scripts\loadgen.ps1 -Sync
+.\scripts\step-metrics.ps1 <run_id>
+.\scripts\step-metrics.ps1 <run_id> -Shard b
 ```
 
 📷 測定3
