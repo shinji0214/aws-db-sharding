@@ -117,6 +117,48 @@ if ($Exec) {
   Write-Host "中で: lab sql a / lab sums / lab check / lab xa-recover ...（待機は IDLE_MAX_SECONDS=3600 秒で自動終了）"
 }
 elseif ($Follow) {
-  # ログを流し続ける。最後に "done:" が出たら計測は終わり。Ctrl+C で表示だけ止まる（タスクは動き続ける）
-  & aws logs tail $LogGroup --log-stream-names $stream --follow --region $Region
+  # ログを流し、タスクが止まったら抜ける。Ctrl+C で表示だけ止まる（タスクは動き続ける）
+  # aws logs tail --follow は自分では終わらないので、別プロセスで流しながらタスクの状態を見る
+  $job = Start-Job -ScriptBlock {
+    param($g, $s, $r)
+    # ログは日本語を含むので、ジョブ側でも UTF-8 で受け渡す
+    $env:PYTHONIOENCODING = "utf-8"
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & aws logs tail $g --log-stream-names $s --follow --region $r 2>&1
+  } -ArgumentList $LogGroup, $stream, $Region
+  $failures = 0
+  $warned = $false
+  try {
+    while ($true) {
+      # aws の警告（stderr）でスクリプトが止まらないよう、ここだけエラーを流す
+      Receive-Job $job -ErrorAction Continue 2>&1 | Write-Host
+      if ($job.State -ne "Running" -and -not $warned) {
+        $warned = $true
+        Write-Warning "ログの表示が止まりました（$($job.State)）。タスクの終了だけ待ちます"
+      }
+      $status = $null
+      try {
+        $tasks = (Invoke-Aws ecs describe-tasks --cluster $Cluster --tasks $taskArn).tasks
+        $status = if ($tasks) { $tasks[0].lastStatus } else { "STOPPED" }
+        $failures = 0
+      }
+      catch {
+        # 一時的な失敗やログインの期限切れ。続けて失敗したら抜ける（タスクは動き続ける）
+        $failures++
+        Write-Warning "タスクの状態を取れませんでした（$failures 回目）: $_"
+        if ($failures -ge 6) { throw "タスクの状態を取れないので Follow をやめます。aws sso login し直して、ログは上の aws logs tail で見てください" }
+      }
+      if ($status -eq "STOPPED") { break }
+      Start-Sleep -Seconds 5
+    }
+    # 最後のログが届くのを少し待つ
+    Start-Sleep -Seconds 10
+    Receive-Job $job -ErrorAction Continue 2>&1 | Write-Host
+    $code = try { (Invoke-Aws ecs describe-tasks --cluster $Cluster --tasks $taskArn).tasks[0].containers[0].exitCode } catch { "不明" }
+    Write-Host "タスクが終了しました（終了コード: $code）"
+  }
+  finally {
+    Stop-Job $job -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+  }
 }

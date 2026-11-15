@@ -237,6 +237,10 @@ cmd_sweep() {
     esac
   done
   wait_for_db
+  # 接続数の上限。1シャードあたりのスレッド数がこれに近い段階は張れずに全滅するので、計測せずに飛ばす
+  local maxconn
+  maxconn=$(mysql_shard 0 -N -B -e "SELECT @@max_connections" "$DB_NAME" 2>/dev/null || echo 0)
+  [[ $maxconn =~ ^[0-9]+$ ]] || maxconn=0
 
   # 動かすシャード。ホットスポットはボスがいるシャードだけ（boss_id もプレイヤーと同じ規則で振り分ける）
   local -a active=()
@@ -261,11 +265,13 @@ cmd_sweep() {
     echo "instance_class=${DB_INSTANCE_CLASS:-unknown} engine_version=${DB_ENGINE_VERSION:-unknown}"
     echo "threads=[${threads:-default}] time=$time warmup=$warmup repeat=$repeat rows=$rows boss=$boss batch=$batch rate=$rate lua=$lua"
     echo "task_cpu=${TASK_CPU:-unknown} nproc=$(nproc)"
+    echo "max_connections=${maxconn}"
     echo "sysbench=$(sysbench --version)"
     if [[ -n "${ECS_CONTAINER_METADATA_URI_V4:-}" ]]; then
       echo "task_metadata:"
-      curl -sf "${ECS_CONTAINER_METADATA_URI_V4}" | jq -c '{Image, ImageID}' || true
-      curl -sf "${ECS_CONTAINER_METADATA_URI_V4}/task" | jq -c '{TaskARN, AvailabilityZone, Limits}' || true
+      # Image と TaskARN にはアカウント ID（12桁）が入るので伏せる（ログをそのまま記事に貼れるように）
+      curl -sf "${ECS_CONTAINER_METADATA_URI_V4}" | jq -c '{Image, ImageID}' | sed -E 's/[0-9]{12}/************/g' || true
+      curl -sf "${ECS_CONTAINER_METADATA_URI_V4}/task" | jq -c '{TaskARN, AvailabilityZone, Limits}' | sed -E 's/[0-9]{12}/************/g' || true
     fi
   } >"$dir/meta.txt"
   cat "$dir/meta.txt" >&2
@@ -297,6 +303,14 @@ cmd_sweep() {
     for ((r = 1; r <= repeat; r++)); do
       local tag
       tag=$(printf 'step%02d-t%03d-r%d' "$step" "$t" "$r")
+      # 管理用の接続ぶん（rdsadmin など）の余裕として 5 本を残す
+      if [[ $maxconn -gt 0 && $per -gt $((maxconn - 5)) ]]; then
+        local now
+        now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        echo "$run_id,$scenario,$label,$step,$r,$t,$per,$nact,${DB_INSTANCE_CLASS:-unknown},NA,NA,NA,0,NA,skip(max_connections=${maxconn}),$now,$now" >>"$summary"
+        log "$tag skip: 1シャードあたり ${per} 本は max_connections=${maxconn} の上限に近いので計測しない"
+        continue
+      fi
       local -a common
       common=(--threads="$per" --rate="$rate_per" --mysql-ignore-errors=1205,1213
         --rows="$rows" --nshards="$NSHARDS" --boss="$boss" --batch="$batch")
@@ -317,15 +331,19 @@ cmd_sweep() {
       start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
       mpstat 1 "$time" >"$dir/$tag-mpstat.txt" 2>&1 &
       local mp=$!
-      local -a outs=()
+      local -a outs=() pids=()
       for i in "${active[@]}"; do
         local out="$dir/$tag-${SHARD_KEYS[$i]}.txt"
         outs+=("$out")
         # shellcheck disable=SC2046
         sysbench "$LUA_DIR/$lua" $(sysbench_args "$i") "${common[@]}" --shard_index="$i" \
           --time="$time" --report-interval=1 --histogram=on --percentile=99 run >"$out" 2>&1 &
+        pids+=($!)
       done
-      wait $(jobs -p | grep -v "^${mp}$") || log "WARN: sysbench が異常終了（$tag の出力を確認）"
+      # 起動時に控えた PID を1つずつ待つ（早く死んだ sysbench は jobs -p から消えるが、wait PID なら終了コードが取れる）
+      local aborted=0 pid
+      for pid in "${pids[@]}"; do wait "$pid" || aborted=1; done
+      [[ $aborted -eq 0 ]] || log "WARN: sysbench が異常終了（$tag の出力を確認）"
       wait "$mp" || true
       end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -339,15 +357,20 @@ cmd_sweep() {
       cpu=$(awk '/^Average:/ && $2 == "all" { printf "%.1f", 100 - $NF }' "$dir/$tag-mpstat.txt")
       valid=yes
       awk -v c="${cpu:-0}" 'BEGIN { exit !(c > 70) }' && valid="no(loadgen-cpu>70%)"
+      awk -v x="$tps" 'BEGIN { exit !(x + 0 == 0) }' && valid="no(tps=0)"
+      [[ $aborted -eq 0 ]] || valid="no(sysbench-aborted)"
       echo "$run_id,$scenario,$label,$step,$r,$t,$per,$nact,${DB_INSTANCE_CLASS:-unknown},$tps,$p95,$p99,$errs,${cpu:-NA},$valid,$start,$end" >>"$summary"
       log "$tag tps=$tps p95=${p95}ms p99=${p99}ms errors=$errs loadgen_cpu=${cpu}% valid=$valid"
       upload "$run_id"
     done
   done
 
+  # 末尾の段階がスキップだった場合（または全段階スキップ）も summary.csv と meta.txt を上げる
+  upload "$run_id"
   log "done: $run_id"
   column -s, -t <"$summary" >&2 2>/dev/null || cat "$summary" >&2
-  [[ -n "${RESULTS_BUCKET:-}" ]] && log "results: s3://${RESULTS_BUCKET}/runs/$run_id/"
+  # バケット名にアカウントIDが入るので、ログ（記事に貼ることがある）には出さない
+  [[ -n "${RESULTS_BUCKET:-}" ]] && log "results: s3://<results-bucket>/runs/$run_id/"
   return 0
 }
 
@@ -452,7 +475,8 @@ cmd_trade() {
   cat "$dir/check-after.txt" >&2
   upload "$run_id"
   log "done: $run_id"
-  [[ -n "${RESULTS_BUCKET:-}" ]] && log "results: s3://${RESULTS_BUCKET}/runs/$run_id/"
+  # バケット名にアカウントIDが入るので、ログ（記事に貼ることがある）には出さない
+  [[ -n "${RESULTS_BUCKET:-}" ]] && log "results: s3://<results-bucket>/runs/$run_id/"
   return 0
 }
 
