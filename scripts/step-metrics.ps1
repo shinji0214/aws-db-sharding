@@ -6,7 +6,7 @@
   results\<run_id>\summary.csv（loadgen.ps1 -Sync で落としたもの）の各段階の start_utc〜end_utc について、
   - CloudWatch: CPUUtilization / CommitLatency / DatabaseConnections の平均
   - Database Insights: DB Load（db.load.avg）の平均と、待機イベントの上位
-  を取り、results\<run_id>\step-metrics.csv と step-waits.csv に書く。画面には段階ごとの要約を出す。
+  を取り、results\<run_id>\step-metrics-<shard>.csv と step-waits-<shard>.csv に書く。画面には段階ごとの要約を出す。
   Database Insights のデータはインスタンスを消すと見られなくなるので、必ず destroy の前に流す。
 
 .EXAMPLE
@@ -56,9 +56,16 @@ function Get-CwAverage([string]$metric, [string]$start, [string]$end) {
 $metrics = @()
 $waits = @()
 $rows = Import-Csv $summary | Where-Object { $_.valid -notlike "skip*" }
+$sty = [Globalization.DateTimeStyles]'AssumeUniversal,AdjustToUniversal'
 foreach ($r in $rows) {
-  $start = $r.start_utc
-  $end = $r.end_utc
+  # CloudWatch も Database Insights も分の境目に丸めて範囲を広げるので、そのままだと次の段階のウォームアップ（本数が多い）が
+  # 混ざる。計測区間の内側の分単位に縮める（180 秒の計測なら、まるごと入る 2 分ぶん）
+  $s = [datetime]::Parse($r.start_utc, [cultureinfo]::InvariantCulture, $sty)
+  $e = [datetime]::Parse($r.end_utc, [cultureinfo]::InvariantCulture, $sty)
+  if ($s.Second -gt 0) { $s = $s.AddSeconds(60 - $s.Second) }
+  $e = $e.AddSeconds(-$e.Second)
+  $start = $s.ToString("yyyy-MM-ddTHH:mm:ssZ")
+  $end = $e.ToString("yyyy-MM-ddTHH:mm:ssZ")
   $cpu = Get-CwAverage "CPUUtilization" $start $end
   $commit = Get-CwAverage "CommitLatency" $start $end
   $conn = Get-CwAverage "DatabaseConnections" $start $end
@@ -82,7 +89,7 @@ foreach ($r in $rows) {
     if ($rank -le 3) { $topText += "$name=$aas" }
   }
 
-  # 1件あたり時間（リトルの法則: 1シャードあたりの本数 ÷ そのシャードの TPS）。シャードが1つのときだけ正確
+  # 1件あたり時間（リトルの法則: 全体の本数 ÷ 全体の TPS）。全シャードの平均で、シャードごとの値ではない
   $perTx = $null
   if ([double]$r.tps -gt 0) { $perTx = [math]::Round(1000.0 * [double]$r.threads_per_shard / ([double]$r.tps / [double]$r.shards), 2) }
 
