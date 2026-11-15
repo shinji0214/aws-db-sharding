@@ -111,34 +111,48 @@ docker compose down -v
 # t4g.medium は max_connections が 90 前後なので、段階は 80 までにする。
 # 上限を超える段階は lab が自動でスキップし（summary.csv の valid=skip(...)）、実際の値は meta.txt の max_connections に残る
 .\scripts\loadgen.ps1 'sweep --scenario s1 --label pattern1-t4g.medium --threads "1 2 4 8 16 32 48 64 80"' -Follow
+
+# 終わったら destroy の前に: 結果を手元へ落とし、段階ごとの CPU・CommitLatency・DB Load・待機イベントを取り出す
+.\scripts\loadgen.ps1 -Sync
+.\scripts\step-metrics.ps1 <run_id>
 ```
+
+2026-11-15 の測定1の結果（80 本で 5,268 TPS、明確な頭打ちの前に max_connections=90 に当たった。
+1件の時間の8〜9割はコミット待ち）を受けて、測定2の段階を決めている。
 
 測定2（別の日。db を apply して prepare からやり直す）:
 
 ```powershell
-# 飽和点付近を3回ずつ測り直す（例: 32〜80 が飽和点付近だった場合。t4g.medium は 80 まで）
-.\scripts\loadgen.ps1 'sweep --scenario s1 --label pattern1-repeat --threads "32 64 80" --repeat 3' -Follow
+# 飽和点付近を3回ずつ測り直す（測定1で伸びが鈍った 48〜80。t4g.medium は 80 まで。約36分）
+.\scripts\loadgen.ps1 'sweep --scenario s1 --label pattern1-repeat --threads "48 64 80" --repeat 3' -Follow
 
-# H2 の確認（任意）: 10件まとめてコミット
-.\scripts\loadgen.ps1 'sweep --scenario s1-batch10 --batch 10 --threads "8 32 80"' -Follow
+# H2 の確認: 10件まとめてコミット。コミット待ちが主なら、同じ本数で行数/秒が大きく伸びるはず（約16分）
+.\scripts\loadgen.ps1 'sweep --scenario s1-batch10 --batch 10 --threads "1 8 32 80"' -Follow
 
-# シナリオ3: ホットスポット（全員でワールドボス 1 を殴る）
+# シナリオ3: ホットスポット（全員でワールドボス 1 を殴る。約28分）
 .\scripts\loadgen.ps1 'sweep --scenario s3 --boss 1 --threads "1 2 4 8 16 32 64"' -Follow
+
+# 各 sweep の後、destroy の前に（run_id は各 sweep の最後の done: の行）
+.\scripts\loadgen.ps1 -Sync
+.\scripts\step-metrics.ps1 <run_id>
 ```
+
+s1-batch10 の tps は「トランザクション/秒」なので、更新した行数/秒は tps × 10 になる。
 
 📷 測定1（シナリオ1の後、destroy の前に）
 - シナリオ1の summary.csv をそのまま保存（M1-6）。`valid = no` の段階がないか確認し、あれば記録（M1-12）
 - 飽和点の段階の `stepNN-...-a.txt`（sysbench の1秒ごとの出力）の一部（M1-7）
 - CloudWatch: CPUUtilization と CommitLatency を同じグラフで（M1-8）、CPUCreditBalance / CPUSurplusCreditBalance /
   CPUSurplusCreditsCharged（M1-9）、DMLThroughput / CommitThroughput / DatabaseConnections（M1-10）。すべて get-metric-data の JSON も残す
-- Database Insights: 飽和点の前後の待機イベント上位（M1-11）
+- Database Insights: 飽和点の前後の待機イベント上位（M1-11）。`step-metrics.ps1` で段階ごとに取れる
 - `lab sql a` で `SHOW VARIABLES LIKE 'max_connections'` の実値（M1-13）
 
 📷 測定2
 - 飽和点付近を3回ずつ測った summary.csv（ばらつきが 10% 以内か。M2-1）
 - s1-batch10 の summary.csv と、そのときの CommitLatency（M2-2）
 - シナリオ3の summary.csv と `lab sums` のボス HP（M2-3）、シナリオ3中の CPU と CommitLatency（M2-4）
-- Database Insights: シナリオ3の待機イベント（行ロック待ちが上位に来るか。M2-5）
+- Database Insights: シナリオ3の待機イベント（行ロック待ちが上位に来るか。M2-5）。`step-metrics.ps1` の step-waits-a.csv
+- 段階ごとの DB Load（step-metrics-a.csv の db_load_aas）。測定1では 80 本でも 1.35 と低かった理由を、1件あたり時間・CommitLatency と並べて確かめる
 - シナリオ3の最中に ECS Exec で `SELECT * FROM performance_schema.data_lock_waits LIMIT 10`（M2-6）。
   sweep は端末を占有するので、別のターミナルで事前に `loadgen.ps1 -Exec` で待機タスクを起動して入っておく
 - 1 ÷ CommitLatency とボスへの最大 TPS が近いかを計算して記録（M2-7）
@@ -266,7 +280,7 @@ lab check                        # 整合性チェック（ゴールド合計・
 
 ## 記録されるもの
 
-`s3://<PROJECT>-results-<ACCOUNT_ID>/runs/<run_id>/`（run_id = `開始時刻-シナリオ-シャード数-インスタンス種別`）
+`s3://<PROJECT>-results-<ACCOUNT_ID>/runs/<run_id>/`（run_id = `開始時刻-シナリオ-シャード数-インスタンス種別`）。`loadgen.ps1 -Sync` で手元の `results\<run_id>\` に落ちる
 
 | ファイル | 中身 |
 |---|---|
@@ -274,6 +288,8 @@ lab check                        # 整合性チェック（ゴールド合計・
 | `meta.txt` | 実行条件（スレッド段階、行数、インスタンス種別、エンジンバージョン、イメージのダイジェスト、タスクの AZ） |
 | `stepNN-tTTT-rR-<shard>.txt` | sysbench の出力そのまま（1秒ごとの推移とヒストグラム） |
 | `stepNN-tTTT-rR-mpstat.txt` | 負荷タスクの CPU（1秒ごと） |
+| `step-metrics-<shard>.csv`（手元） | `step-metrics.ps1` の出力。段階ごとの 1件あたり時間、CommitLatency、DB の CPU・接続数、DB Load |
+| `step-waits-<shard>.csv`（手元） | `step-metrics.ps1` の出力。段階ごとの待機イベント上位 |
 
 DB 側のメトリクスは summary.csv の開始・終了時刻で取り出す（画面のスクリーンショットだけにしない）。
 
